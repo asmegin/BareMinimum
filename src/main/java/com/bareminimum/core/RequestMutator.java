@@ -12,6 +12,7 @@ import com.bareminimum.model.RemovableItem;
 import com.bareminimum.model.RemovableItem.Category;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,9 +26,10 @@ import java.util.function.Function;
  * requests, both while searching for the minimal set and when applying a saved
  * {@link MinimizationProfile}.
  *
- * <p>Extraction and mutation share one parse of the request, and items are addressed by their
- * position within their category, so a request with repeated cookie, header or parameter names is
- * handled exactly. Everything that is kept is copied verbatim from the original request.
+ * <p>A request is parsed once into a {@link Prepared} form, which a minimization run then reuses
+ * for every test request it builds. Items are addressed by their position within their category,
+ * so a request with repeated cookie, header or parameter names is handled exactly, and everything
+ * that is kept is copied verbatim from the original request.
  */
 public final class RequestMutator {
 
@@ -51,37 +53,24 @@ public final class RequestMutator {
     }
 
     /**
+     * Parses {@code request} once for the given target and settings. The result is immutable and
+     * safe to use from several threads at the same time.
+     */
+    public static Prepared prepare(HttpRequest request, MinimizationTarget target, MinimizationConfig config) {
+        return new Prepared(request, target, config);
+    }
+
+    /**
      * Extracts all removable items from {@code request} matching the given {@code target}.
      */
     public static List<RemovableItem> extractCandidates(
             HttpRequest request,
             MinimizationTarget target,
             MinimizationConfig config) {
-        List<RemovableItem> items = new ArrayList<>();
         if (request == null) {
-            return items;
+            return new ArrayList<>();
         }
-
-        if (target.includesCookies()) {
-            addItems(items, Category.COOKIE, cookieSegments(request));
-        }
-
-        if (target.includesHeaders()) {
-            int idx = 0;
-            for (HttpHeader header : request.headers()) {
-                if (isCandidateHeader(header, config)) {
-                    items.add(new RemovableItem(Category.HEADER, header.name(), clip(header.value()), idx++));
-                }
-            }
-        }
-
-        if (target.includesParameters()) {
-            addItems(items, Category.URL_PARAM, querySegments(request));
-            ParsedBody body = parseBody(request);
-            addItems(items, body.category(), body.segments());
-        }
-
-        return items;
+        return new ArrayList<>(prepare(request, target, config).candidates());
     }
 
     /**
@@ -94,14 +83,10 @@ public final class RequestMutator {
             MinimizationTarget target,
             Set<RemovableItem> keptItems,
             MinimizationConfig config) {
-        Map<Category, Set<Integer>> keptIndexes = new LinkedHashMap<>();
-        for (RemovableItem item : keptItems) {
-            keptIndexes.computeIfAbsent(item.category(), c -> new HashSet<>()).add(item.occurrenceIndex());
+        if (original == null) {
+            return null;
         }
-        return applyFilter(original, target, config, (category, index, name) -> {
-            Set<Integer> kept = keptIndexes.get(category);
-            return kept != null && kept.contains(index);
-        });
+        return prepare(original, target, config).build(keptItems);
     }
 
     /**
@@ -113,7 +98,10 @@ public final class RequestMutator {
             HttpRequest request,
             MinimizationProfile profile,
             MinimizationConfig config) {
-        return applyFilter(request, profile.getTarget(), config, (category, index, name) -> switch (category) {
+        if (request == null) {
+            return null;
+        }
+        return prepare(request, profile.getTarget(), config).apply((category, index, name) -> switch (category) {
             case COOKIE -> profile.getRequiredCookies().contains(name);
             case HEADER -> profile.isHeaderRequired(name);
             case URL_PARAM -> profile.getRequiredUrlParams().contains(name);
@@ -125,118 +113,256 @@ public final class RequestMutator {
      * Returns the names of the cookies sent in the request's {@code Cookie} header(s), in order.
      */
     public static List<String> cookieNames(HttpRequest request) {
-        return cookieSegments(request).stream().map(Segment::name).toList();
+        return cookieSegments(request.headers()).stream().map(Segment::name).toList();
     }
 
-    private static HttpRequest applyFilter(
-            HttpRequest request,
-            MinimizationTarget target,
-            MinimizationConfig config,
-            ItemFilter filter) {
-        if (request == null) {
-            return null;
+    /**
+     * A request parsed for one target and one set of settings.
+     */
+    public static final class Prepared {
+        private final HttpRequest original;
+        private final MinimizationTarget target;
+        private final List<HttpHeader> headers;
+        private final List<HttpHeader> candidateHeaders;
+        private final List<HttpHeader> cookieHeaders;
+        private final List<Segment> cookies;
+        private final String path;
+        private final List<Segment> query;
+        private final ParsedBody body;
+        private final List<RemovableItem> candidates;
+
+        private Prepared(HttpRequest original, MinimizationTarget target, MinimizationConfig config) {
+            this.original = original;
+            this.target = target;
+            this.headers = List.copyOf(original.headers());
+
+            List<HttpHeader> candidateList = new ArrayList<>();
+            List<HttpHeader> cookieList = new ArrayList<>();
+            for (HttpHeader header : headers) {
+                String name = header.name();
+                if (name == null) {
+                    continue;
+                }
+                if (COOKIE.equalsIgnoreCase(name)) {
+                    cookieList.add(header);
+                } else if (!config.isHeaderPinned(name)) {
+                    candidateList.add(header);
+                }
+            }
+            this.candidateHeaders = target.includesHeaders() ? List.copyOf(candidateList) : List.of();
+            this.cookieHeaders = List.copyOf(cookieList);
+            this.cookies = target.includesCookies() ? cookieSegments(cookieList) : List.of();
+
+            String requestPath = target.includesParameters() ? original.path() : null;
+            this.path = requestPath;
+            this.query = requestPath == null ? List.of() : querySegments(requestPath);
+            this.body = target.includesParameters() ? parseBody(original, headers) : ParsedBody.NONE;
+
+            List<RemovableItem> items = new ArrayList<>();
+            addItems(items, Category.COOKIE, cookies);
+            for (int i = 0; i < candidateHeaders.size(); i++) {
+                HttpHeader header = candidateHeaders.get(i);
+                items.add(new RemovableItem(Category.HEADER, header.name(), clip(header.value()), i));
+            }
+            addItems(items, Category.URL_PARAM, query);
+            addItems(items, body.category(), body.segments());
+            this.candidates = Collections.unmodifiableList(items);
         }
-        // Every decision is made against the unmodified request, so the positions seen here are
-        // the same ones extractCandidates() reported.
-        HttpRequest mutated = request;
-        if (target.includesCookies()) {
-            mutated = filterCookies(request, mutated, filter);
+
+        public HttpRequest original() {
+            return original;
         }
-        if (target.includesHeaders()) {
-            mutated = filterHeaders(request, mutated, config, filter);
+
+        public MinimizationTarget target() {
+            return target;
         }
-        if (target.includesParameters()) {
-            mutated = filterQuery(request, mutated, filter);
-            mutated = filterBody(request, mutated, filter);
+
+        /** The removable items of the request, in a stable order. */
+        public List<RemovableItem> candidates() {
+            return candidates;
         }
-        return mutated;
+
+        /** Builds the request keeping exactly {@code keptItems} (and everything not removable). */
+        public HttpRequest build(Set<RemovableItem> keptItems) {
+            Map<Category, Set<Integer>> keptIndexes = new LinkedHashMap<>();
+            for (RemovableItem item : keptItems) {
+                keptIndexes.computeIfAbsent(item.category(), c -> new HashSet<>()).add(item.occurrenceIndex());
+            }
+            return apply((category, index, name) -> {
+                Set<Integer> kept = keptIndexes.get(category);
+                return kept != null && kept.contains(index);
+            });
+        }
+
+        /** Builds the request keeping exactly the items {@code filter} accepts. */
+        public HttpRequest apply(ItemFilter filter) {
+            HttpRequest mutated = original;
+            if (target.includesCookies()) {
+                mutated = filterCookies(mutated, filter);
+            }
+            if (target.includesHeaders()) {
+                mutated = filterHeaders(mutated, filter);
+            }
+            if (target.includesParameters()) {
+                mutated = filterQuery(mutated, filter);
+                mutated = filterBody(mutated, filter);
+            }
+            return mutated;
+        }
+
+        private HttpRequest filterCookies(HttpRequest mutated, ItemFilter filter) {
+            if (cookieHeaders.isEmpty()) {
+                return mutated;
+            }
+            List<Segment> kept = keep(cookies, Category.COOKIE, filter);
+            if (kept.size() == cookies.size()) {
+                return mutated;
+            }
+
+            String headerName = cookieHeaders.get(0).name();
+            if (kept.isEmpty()) {
+                return removeAllNamed(mutated, headerName);
+            }
+            StringBuilder value = new StringBuilder();
+            for (Segment cookie : kept) {
+                if (value.length() > 0) {
+                    value.append("; ");
+                }
+                value.append(cookie.raw());
+            }
+            if (cookieHeaders.size() == 1) {
+                // Keeps the Cookie header where it was in the request.
+                return mutated.withUpdatedHeader(headerName, value.toString());
+            }
+            return removeAllNamed(mutated, headerName).withAddedHeader(headerName, value.toString());
+        }
+
+        private HttpRequest filterHeaders(HttpRequest mutated, ItemFilter filter) {
+            // Group candidate headers by name so repeated header names are handled deterministically.
+            Map<String, List<HttpHeader>> allByName = new LinkedHashMap<>();
+            Map<String, List<HttpHeader>> keptByName = new LinkedHashMap<>();
+            for (int i = 0; i < candidateHeaders.size(); i++) {
+                HttpHeader header = candidateHeaders.get(i);
+                String key = header.name().toLowerCase(Locale.ROOT);
+                allByName.computeIfAbsent(key, k -> new ArrayList<>()).add(header);
+                List<HttpHeader> keptForName = keptByName.computeIfAbsent(key, k -> new ArrayList<>());
+                if (filter.keep(Category.HEADER, i, header.name())) {
+                    keptForName.add(header);
+                }
+            }
+
+            HttpRequest result = mutated;
+            for (Map.Entry<String, List<HttpHeader>> entry : allByName.entrySet()) {
+                List<HttpHeader> all = entry.getValue();
+                List<HttpHeader> kept = keptByName.get(entry.getKey());
+                if (kept.size() == all.size()) {
+                    continue;
+                }
+                result = removeAllNamed(result, all.get(0).name());
+                for (HttpHeader header : kept) {
+                    result = result.withAddedHeader(header.name(), header.value());
+                }
+            }
+            return result;
+        }
+
+        private HttpRequest filterQuery(HttpRequest mutated, ItemFilter filter) {
+            if (query.isEmpty()) {
+                return mutated;
+            }
+            List<Segment> kept = keep(query, Category.URL_PARAM, filter);
+            if (kept.size() == query.size()) {
+                return mutated;
+            }
+            String base = path.substring(0, path.indexOf('?'));
+            return mutated.withPath(kept.isEmpty() ? base : base + "?" + RequestParts.joinPairs(kept));
+        }
+
+        private HttpRequest filterBody(HttpRequest mutated, ItemFilter filter) {
+            if (body.segments().isEmpty()) {
+                return mutated;
+            }
+            List<Segment> kept = keep(body.segments(), body.category(), filter);
+            if (kept.size() == body.segments().size()) {
+                return mutated;
+            }
+            // withBody() also updates Content-Length to match the new body.
+            return mutated.withBody(body.rebuilder().apply(kept));
+        }
     }
 
-    // --- Cookies ---------------------------------------------------------------------------
+    // --- Parsing ---------------------------------------------------------------------------
 
-    private static List<Segment> cookieSegments(HttpRequest request) {
+    private static List<Segment> cookieSegments(List<HttpHeader> headers) {
         List<Segment> segments = new ArrayList<>();
-        for (HttpHeader header : request.headers()) {
+        for (HttpHeader header : headers) {
             if (COOKIE.equalsIgnoreCase(header.name())) {
                 segments.addAll(RequestParts.splitCookies(header.value()));
             }
         }
-        return segments;
+        return List.copyOf(segments);
     }
 
-    private static HttpRequest filterCookies(HttpRequest original, HttpRequest mutated, ItemFilter filter) {
-        List<HttpHeader> cookieHeaders = original.headers().stream()
-                .filter(h -> COOKIE.equalsIgnoreCase(h.name()))
-                .toList();
-        if (cookieHeaders.isEmpty()) {
-            return mutated;
-        }
-        List<Segment> all = cookieSegments(original);
-        List<Segment> kept = keep(all, Category.COOKIE, filter);
-        if (kept.size() == all.size()) {
-            return mutated;
-        }
-
-        String headerName = cookieHeaders.get(0).name();
-        if (kept.isEmpty()) {
-            return removeAllNamed(mutated, headerName);
-        }
-        StringBuilder value = new StringBuilder();
-        for (Segment cookie : kept) {
-            if (value.length() > 0) {
-                value.append("; ");
-            }
-            value.append(cookie.raw());
-        }
-        if (cookieHeaders.size() == 1) {
-            // Keeps the Cookie header where it was in the request.
-            return mutated.withUpdatedHeader(headerName, value.toString());
-        }
-        return removeAllNamed(mutated, headerName).withAddedHeader(headerName, value.toString());
+    private static List<Segment> querySegments(String path) {
+        int q = path.indexOf('?');
+        return q < 0 ? List.of() : List.copyOf(RequestParts.splitPairs(path.substring(q + 1)));
     }
 
-    // --- Headers ---------------------------------------------------------------------------
-
-    private static boolean isCandidateHeader(HttpHeader header, MinimizationConfig config) {
-        String name = header.name();
-        return name != null && !COOKIE.equalsIgnoreCase(name) && !config.isHeaderPinned(name);
-    }
-
-    private static HttpRequest filterHeaders(
-            HttpRequest original,
-            HttpRequest mutated,
-            MinimizationConfig config,
-            ItemFilter filter) {
-        // Group candidate headers by name so repeated header names are handled deterministically.
-        Map<String, List<HttpHeader>> allByName = new LinkedHashMap<>();
-        Map<String, List<HttpHeader>> keptByName = new LinkedHashMap<>();
-        int idx = 0;
-        for (HttpHeader header : original.headers()) {
-            if (!isCandidateHeader(header, config)) {
-                continue;
-            }
-            String key = header.name().toLowerCase(Locale.ROOT);
-            allByName.computeIfAbsent(key, k -> new ArrayList<>()).add(header);
-            keptByName.computeIfAbsent(key, k -> new ArrayList<>());
-            if (filter.keep(Category.HEADER, idx++, header.name())) {
-                keptByName.get(key).add(header);
-            }
+    private static ParsedBody parseBody(HttpRequest request, List<HttpHeader> headers) {
+        String body = request.bodyToString();
+        if (body == null || body.isEmpty()) {
+            return ParsedBody.NONE;
         }
 
-        HttpRequest result = mutated;
-        for (Map.Entry<String, List<HttpHeader>> entry : allByName.entrySet()) {
-            List<HttpHeader> all = entry.getValue();
-            List<HttpHeader> kept = keptByName.get(entry.getKey());
-            if (kept.size() == all.size()) {
-                continue;
+        // JSON is recognised by content rather than by Content-Type, which is often wrong.
+        List<JsonField> jsonFields = JsonBodyHelper.parseTopLevelObject(body);
+        if (!jsonFields.isEmpty()) {
+            List<Segment> segments = new ArrayList<>(jsonFields.size());
+            for (JsonField field : jsonFields) {
+                // The segment's raw text is the member exactly as it is written back out.
+                segments.add(new Segment(field.name(), field.rawValue(), JsonBodyHelper.renderField(field)));
             }
-            result = removeAllNamed(result, all.get(0).name());
-            for (HttpHeader header : kept) {
-                result = result.withAddedHeader(header.name(), header.value());
+            return new ParsedBody(Category.JSON_PARAM, List.copyOf(segments), kept -> {
+                StringBuilder sb = new StringBuilder("{");
+                for (int i = 0; i < kept.size(); i++) {
+                    if (i > 0) {
+                        sb.append(", ");
+                    }
+                    sb.append(kept.get(i).raw());
+                }
+                return sb.append('}').toString();
+            });
+        }
+
+        String contentType = headerValue(headers, CONTENT_TYPE);
+        String lowerContentType = contentType == null ? null : contentType.toLowerCase(Locale.ROOT);
+
+        if (lowerContentType != null && lowerContentType.contains("multipart/form-data")) {
+            Multipart multipart = RequestParts.parseMultipart(body, RequestParts.multipartBoundary(contentType));
+            return multipart == null
+                    ? ParsedBody.NONE
+                    : new ParsedBody(Category.BODY_PARAM, List.copyOf(multipart.parts()), multipart::rebuild);
+        }
+
+        boolean urlEncoded = lowerContentType != null
+                ? lowerContentType.contains("application/x-www-form-urlencoded")
+                : RequestParts.looksUrlEncoded(body);
+        if (urlEncoded) {
+            return new ParsedBody(Category.BODY_PARAM, List.copyOf(RequestParts.splitPairs(body)), RequestParts::joinPairs);
+        }
+        return ParsedBody.NONE;
+    }
+
+    private static String headerValue(List<HttpHeader> headers, String name) {
+        for (HttpHeader header : headers) {
+            if (name.equalsIgnoreCase(header.name())) {
+                return header.value();
             }
         }
-        return result;
+        return null;
     }
+
+    // --- Shared helpers --------------------------------------------------------------------
 
     /**
      * Removes every header with the given name (case-insensitively), whether the underlying
@@ -260,99 +386,6 @@ public final class RequestMutator {
         }
         return result;
     }
-
-    private static String headerValue(HttpRequest request, String name) {
-        for (HttpHeader header : request.headers()) {
-            if (name.equalsIgnoreCase(header.name())) {
-                return header.value();
-            }
-        }
-        return null;
-    }
-
-    // --- URL query parameters --------------------------------------------------------------
-
-    private static List<Segment> querySegments(HttpRequest request) {
-        String path = request.path();
-        int q = path == null ? -1 : path.indexOf('?');
-        return q < 0 ? List.of() : RequestParts.splitPairs(path.substring(q + 1));
-    }
-
-    private static HttpRequest filterQuery(HttpRequest original, HttpRequest mutated, ItemFilter filter) {
-        List<Segment> all = querySegments(original);
-        if (all.isEmpty()) {
-            return mutated;
-        }
-        List<Segment> kept = keep(all, Category.URL_PARAM, filter);
-        if (kept.size() == all.size()) {
-            return mutated;
-        }
-        String path = original.path();
-        String base = path.substring(0, path.indexOf('?'));
-        return mutated.withPath(kept.isEmpty() ? base : base + "?" + RequestParts.joinPairs(kept));
-    }
-
-    // --- Body parameters (form-urlencoded, multipart, top-level JSON) ----------------------
-
-    private static ParsedBody parseBody(HttpRequest request) {
-        String body = request.bodyToString();
-        if (body == null || body.isEmpty()) {
-            return ParsedBody.NONE;
-        }
-
-        // JSON is recognised by content rather than by Content-Type, which is often wrong.
-        List<JsonField> jsonFields = JsonBodyHelper.parseTopLevelObject(body);
-        if (!jsonFields.isEmpty()) {
-            List<Segment> segments = new ArrayList<>(jsonFields.size());
-            for (JsonField field : jsonFields) {
-                // The segment's raw text is the member exactly as it is written back out.
-                segments.add(new Segment(field.name(), field.rawValue(), JsonBodyHelper.renderField(field)));
-            }
-            return new ParsedBody(Category.JSON_PARAM, segments, kept -> {
-                StringBuilder sb = new StringBuilder("{");
-                for (int i = 0; i < kept.size(); i++) {
-                    if (i > 0) {
-                        sb.append(", ");
-                    }
-                    sb.append(kept.get(i).raw());
-                }
-                return sb.append('}').toString();
-            });
-        }
-
-        String contentType = headerValue(request, CONTENT_TYPE);
-        String lowerContentType = contentType == null ? null : contentType.toLowerCase(Locale.ROOT);
-
-        if (lowerContentType != null && lowerContentType.contains("multipart/form-data")) {
-            Multipart multipart = RequestParts.parseMultipart(body, RequestParts.multipartBoundary(contentType));
-            return multipart == null
-                    ? ParsedBody.NONE
-                    : new ParsedBody(Category.BODY_PARAM, multipart.parts(), multipart::rebuild);
-        }
-
-        boolean urlEncoded = lowerContentType != null
-                ? lowerContentType.contains("application/x-www-form-urlencoded")
-                : RequestParts.looksUrlEncoded(body);
-        if (urlEncoded) {
-            return new ParsedBody(Category.BODY_PARAM, RequestParts.splitPairs(body), RequestParts::joinPairs);
-        }
-        return ParsedBody.NONE;
-    }
-
-    private static HttpRequest filterBody(HttpRequest original, HttpRequest mutated, ItemFilter filter) {
-        ParsedBody body = parseBody(original);
-        if (body.segments().isEmpty()) {
-            return mutated;
-        }
-        List<Segment> kept = keep(body.segments(), body.category(), filter);
-        if (kept.size() == body.segments().size()) {
-            return mutated;
-        }
-        // withBody() also updates Content-Length to match the new body.
-        return mutated.withBody(body.rebuilder().apply(kept));
-    }
-
-    // --- Shared helpers --------------------------------------------------------------------
 
     private static List<Segment> keep(List<Segment> segments, Category category, ItemFilter filter) {
         List<Segment> kept = new ArrayList<>(segments.size());

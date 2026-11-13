@@ -18,6 +18,7 @@ public final class SettingsPersistence {
     private static final String FORBIDDEN_SUBSTRING = PREFIX + "forbiddenSubstring";
     private static final String PINNED_HEADERS = PREFIX + "pinnedHeaders";
     private static final String REQUEST_DELAY = PREFIX + "requestDelayMs";
+    private static final String PARALLELISM = PREFIX + "parallelism";
 
     private SettingsPersistence() {
     }
@@ -68,6 +69,10 @@ public final class SettingsPersistence {
             if (delay != null) {
                 config.setRequestDelayMs(delay);
             }
+            Integer parallelism = prefs.getInteger(PARALLELISM);
+            if (parallelism != null) {
+                config.setParallelism(parallelism);
+            }
         } catch (RuntimeException ignored) {
             // Preferences are a convenience; fall back to defaults if they cannot be read.
         }
@@ -86,5 +91,6 @@ public final class SettingsPersistence {
         prefs.setString(FORBIDDEN_SUBSTRING, config.getForbiddenSubstring());
         prefs.setString(PINNED_HEADERS, config.getPinnedHeadersCsv());
         prefs.setInteger(REQUEST_DELAY, config.getRequestDelayMs());
+        prefs.setInteger(PARALLELISM, config.getParallelism());
     }
 }

@@ -19,7 +19,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
@@ -34,6 +38,7 @@ public final class MinimizationJobManager {
     private final MontoyaApi api;
     private final DeltaDebugMinimizer minimizer;
     private final ExecutorService executor;
+    private final ThreadPoolExecutor requestExecutor;
     private final List<ProgressListener> uiListeners = new CopyOnWriteArrayList<>();
     private final Set<AtomicBoolean> outstandingCancelFlags = ConcurrentHashMap.newKeySet();
     private volatile AtomicBoolean runningCancelFlag;
@@ -47,6 +52,18 @@ public final class MinimizationJobManager {
             t.setDaemon(true);
             return t;
         });
+        // Sends the test requests of a round in parallel. Only one job runs at a time, so the pool
+        // never needs more threads than the highest parallelism setting; idle threads exit.
+        AtomicInteger threadNumber = new AtomicInteger();
+        this.requestExecutor = new ThreadPoolExecutor(
+                MinimizationConfig.MAX_PARALLELISM, MinimizationConfig.MAX_PARALLELISM,
+                30, TimeUnit.SECONDS, new LinkedBlockingQueue<>(),
+                r -> {
+                    Thread t = new Thread(r, "BareMinimum-Request-" + threadNumber.incrementAndGet());
+                    t.setDaemon(true);
+                    return t;
+                });
+        this.requestExecutor.allowCoreThreadTimeOut(true);
     }
 
     public void addProgressListener(ProgressListener listener) {
@@ -68,6 +85,7 @@ public final class MinimizationJobManager {
             flag.set(true);
         }
         executor.shutdownNow();
+        requestExecutor.shutdownNow();
         uiListeners.clear();
     }
 
@@ -135,17 +153,19 @@ public final class MinimizationJobManager {
                                 }
                             });
                         }
-                    });
+                    },
+                    requestExecutor);
 
             MinimizationProfile profile = result.profile();
             if (profile != null) {
                 logOutput(String.format(
-                        "Completed -> saved as '%s' (%s): kept %d / %d items in %d HTTP requests.",
+                        "Completed -> saved as '%s' (%s): kept %d / %d items in %d HTTP requests (%d rounds).",
                         clean(profile.getName()),
                         profile.getShortSummary(),
                         result.requiredItems().size(),
                         result.allCandidates().size(),
-                        result.requestsSent()));
+                        result.requestsSent(),
+                        result.rounds()));
             } else if (result.errorMessage() != null) {
                 logError(result.errorMessage());
             } else if (result.cancelled()) {

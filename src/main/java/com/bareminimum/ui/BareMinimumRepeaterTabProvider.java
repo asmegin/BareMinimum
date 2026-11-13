@@ -312,7 +312,7 @@ public final class BareMinimumRepeaterTabProvider implements HttpRequestEditorPr
                 if (result.profile() != null) {
                     statusLabel.setText("Saved profile '" + result.profile().getName() + "' — kept "
                             + result.requiredItems().size() + "/" + result.allCandidates().size()
-                            + " items in " + result.requestsSent() + " requests.");
+                            + " items in " + result.requestsSent() + " requests (" + result.rounds() + " rounds).");
                     if (editable && autoApplyCheckBox.isSelected() && result.minimizedRequest() != null) {
                         rememberBackup(base);
                         showProducedRequest(result.minimizedRequest());

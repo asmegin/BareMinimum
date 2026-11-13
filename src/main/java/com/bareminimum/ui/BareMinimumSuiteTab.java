@@ -315,6 +315,19 @@ public final class BareMinimumSuiteTab extends JPanel implements ProgressListene
                 config.setRequestDelayMs(((Number) delaySpinner.getValue()).intValue()));
         form.add(delaySpinner, gbc);
 
+        // 9. Parallel requests
+        row++;
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        form.add(new JLabel("Parallel requests (1 = one at a time; a delay above forces 1):"), gbc);
+
+        gbc.gridx = 1;
+        JSpinner parallelSpinner = new JSpinner(new SpinnerNumberModel(
+                config.getParallelism(), 1, MinimizationConfig.MAX_PARALLELISM, 1));
+        parallelSpinner.addChangeListener(e ->
+                config.setParallelism(((Number) parallelSpinner.getValue()).intValue()));
+        form.add(parallelSpinner, gbc);
+
         row++;
         gbc.gridx = 0;
         gbc.gridy = row;
@@ -450,7 +463,7 @@ public final class BareMinimumSuiteTab extends JPanel implements ProgressListene
         } else if (result.profile() != null) {
             jobStatusLabel.setText("Saved '" + result.profile().getName() + "' — kept "
                     + result.requiredItems().size() + " / " + result.allCandidates().size()
-                    + " items in " + result.requestsSent() + " requests.");
+                    + " items in " + result.requestsSent() + " requests (" + result.rounds() + " rounds).");
             int row = profileStore.getProfiles().indexOf(result.profile());
             if (row >= 0 && row < profilesTable.getRowCount()) {
                 profilesTable.setRowSelectionInterval(row, row);
@@ -522,7 +535,7 @@ public final class BareMinimumSuiteTab extends JPanel implements ProgressListene
 
     private static final class StepLogTableModel extends AbstractTableModel {
         private static final String[] COLUMNS = {
-                "Step #", "Test Description", "Kept / Total", "HTTP Status", "Body Length", "Matches Baseline?"
+                "Step #", "Round", "Test Description", "Kept / Total", "HTTP Status", "Body Length", "Matches Baseline?"
         };
         private final List<StepLog> logs = new ArrayList<>();
 
@@ -558,11 +571,12 @@ public final class BareMinimumSuiteTab extends JPanel implements ProgressListene
             StepLog s = logs.get(rowIndex);
             return switch (columnIndex) {
                 case 0 -> s.stepNumber();
-                case 1 -> s.description();
-                case 2 -> s.keptCount() + " / " + s.totalCandidates();
-                case 3 -> s.statusCode() == 0 ? "—" : String.valueOf(s.statusCode());
-                case 4 -> s.bodyLength() + " B";
-                case 5 -> s.matchedBaseline() ? "✓ PASS (Equivalent)" : "✗ FAIL (Different)";
+                case 1 -> s.round();
+                case 2 -> s.description();
+                case 3 -> s.keptCount() + " / " + s.totalCandidates();
+                case 4 -> s.statusCode() == 0 ? "—" : String.valueOf(s.statusCode());
+                case 5 -> s.bodyLength() + " B";
+                case 6 -> s.matchedBaseline() ? "✓ PASS (Equivalent)" : "✗ FAIL (Different)";
                 default -> "";
             };
         }

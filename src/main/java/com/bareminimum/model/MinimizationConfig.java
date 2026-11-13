@@ -17,6 +17,8 @@ import java.util.stream.Collectors;
  */
 public final class MinimizationConfig {
     public static final int MAX_REQUEST_DELAY_MS = 60_000;
+    public static final int DEFAULT_PARALLELISM = 4;
+    public static final int MAX_PARALLELISM = 16;
 
     private volatile boolean matchStatusCode = true;
     private volatile boolean matchBodyLength = true;
@@ -27,6 +29,7 @@ public final class MinimizationConfig {
     private volatile String forbiddenSubstring = "";
     private volatile Set<String> pinnedHeaders = defaultPinnedHeaders();
     private volatile int requestDelayMs = 0;
+    private volatile int parallelism = DEFAULT_PARALLELISM;
     private volatile Runnable changeListener;
 
     public static Set<String> defaultPinnedHeaders() {
@@ -50,6 +53,7 @@ public final class MinimizationConfig {
         copy.forbiddenSubstring = forbiddenSubstring;
         copy.pinnedHeaders = pinnedHeaders;
         copy.requestDelayMs = requestDelayMs;
+        copy.parallelism = parallelism;
         return copy;
     }
 
@@ -173,5 +177,23 @@ public final class MinimizationConfig {
     public void setRequestDelayMs(int requestDelayMs) {
         this.requestDelayMs = Math.max(0, Math.min(MAX_REQUEST_DELAY_MS, requestDelayMs));
         changed();
+    }
+
+    /** Maximum number of test requests sent at the same time (1 sends them one after another). */
+    public int getParallelism() {
+        return parallelism;
+    }
+
+    public void setParallelism(int parallelism) {
+        this.parallelism = Math.max(1, Math.min(MAX_PARALLELISM, parallelism));
+        changed();
+    }
+
+    /**
+     * Parallelism that actually applies: a delay between requests means the target is being
+     * rate-limited, so requests are then always sent one at a time.
+     */
+    public int getEffectiveParallelism() {
+        return requestDelayMs > 0 ? 1 : parallelism;
     }
 }

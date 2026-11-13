@@ -2,32 +2,56 @@ package com.bareminimum.core;
 
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
+import com.bareminimum.core.RequestMutator.Prepared;
 import com.bareminimum.model.MinimizationConfig;
 import com.bareminimum.model.MinimizationProfile;
 import com.bareminimum.model.MinimizationTarget;
 import com.bareminimum.model.RemovableItem;
 import com.bareminimum.model.RemovableItem.Category;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.function.Predicate;
 
 /**
- * Performs binary-search delta debugging (QuickXplain + category pruning) to find the bare minimum
- * required set of cookies, headers, and/or parameters in O(k log N) HTTP requests.
+ * Finds the bare minimum set of cookies, headers and/or parameters a request needs.
  *
- * <p>The search is only meaningful while the target keeps answering the same request the same
- * way, so the minimized request is confirmed with a request sent at the very end of the run. If
- * that check fails, the original request is sent again: if it no longer reproduces the baseline
- * (an expired session, a rate limit ...) the run fails without saving anything, otherwise the run
+ * <h2>Search</h2>
+ * Every test request removes one group of items from the request and asks a single question: is
+ * anything in this group required? If the response still matches the baseline, the whole group is
+ * dropped for good; if not, the group is known to hold at least one required item and is split in
+ * half. This is adaptive group testing (Hwang's generalised binary splitting): the size of the
+ * groups it tries is chosen from how dense the required items have turned out to be so far, so it
+ * needs very few requests when most items are junk and falls back to roughly one request per item
+ * when most items are required, which is the cost of removing items one at a time.
+ *
+ * <h2>Parallelism</h2>
+ * Under that model, tests of different groups do not depend on each other, so each round sends
+ * several of them at once (up to the configured parallelism P). A group known to hold a required
+ * item is split into P + 1 parts, P of which are tested together while the last is inferred, so a
+ * round narrows it down by a factor of P + 1 for about the same number of requests as halving.
+ * Spare capacity goes to untested groups. The first round also sends the baseline, the stability
+ * check and the "remove everything" test together.
+ *
+ * <h2>Verification</h2>
+ * The search is only meaningful while the target keeps answering the same request the same way,
+ * so the minimized request is confirmed with a request sent at the very end of the run. If that
+ * check fails, the original request is sent again: if it no longer reproduces the baseline (an
+ * expired session, a rate limit ...) the run fails without saving anything, otherwise the run
  * falls back to one-by-one elimination.
  */
 public final class DeltaDebugMinimizer {
@@ -37,6 +61,7 @@ public final class DeltaDebugMinimizer {
 
     public record StepLog(
             int stepNumber,
+            int round,
             String description,
             int keptCount,
             int totalCandidates,
@@ -53,6 +78,7 @@ public final class DeltaDebugMinimizer {
             List<RemovableItem> allCandidates,
             List<RemovableItem> requiredItems,
             int requestsSent,
+            int rounds,
             short baselineStatusCode,
             int baselineBodyLength,
             boolean cancelled,
@@ -84,16 +110,8 @@ public final class DeltaDebugMinimizer {
     }
 
     /**
-     * Executes the minimization algorithm synchronously on the caller's thread (call from a
-     * background worker, never from the Swing thread). Never throws: failures are reported through
-     * {@link MinimizationResult#errorMessage()}.
-     *
-     * @param originalRequest  The request to minimize
-     * @param existingBaseline Optional existing baseline response; if null, sends a baseline request first
-     * @param target           Which categories to minimize (COOKIES, HEADERS, PARAMETERS, or ALL)
-     * @param requestSender    Function that sends an HttpRequest and returns its HttpResponse (null if none)
-     * @param cancelFlag       Allows cleanly aborting an in-progress run
-     * @param listener         Receives live progress updates
+     * Runs a minimization sending one request at a time. See
+     * {@link #minimize(HttpRequest, HttpResponse, MinimizationTarget, Function, AtomicBoolean, ProgressListener, ExecutorService)}.
      */
     public MinimizationResult minimize(
             HttpRequest originalRequest,
@@ -102,10 +120,37 @@ public final class DeltaDebugMinimizer {
             Function<HttpRequest, HttpResponse> requestSender,
             AtomicBoolean cancelFlag,
             ProgressListener listener) {
+        return minimize(originalRequest, existingBaseline, target, requestSender, cancelFlag, listener, null);
+    }
+
+    /**
+     * Executes the minimization synchronously on the caller's thread (call from a background
+     * worker, never from the Swing thread). Never throws: failures are reported through
+     * {@link MinimizationResult#errorMessage()}.
+     *
+     * @param originalRequest  The request to minimize
+     * @param existingBaseline Optional existing baseline response; if null, sends a baseline request first
+     * @param target           Which categories to minimize (COOKIES, HEADERS, PARAMETERS, or ALL)
+     * @param requestSender    Sends a request and returns its response (null if none); must be thread-safe
+     *                         when {@code requestExecutor} is given
+     * @param cancelFlag       Allows cleanly aborting an in-progress run
+     * @param listener         Receives live progress updates
+     * @param requestExecutor  Threads used to send several test requests at once, or null to send
+     *                         them one at a time
+     */
+    public MinimizationResult minimize(
+            HttpRequest originalRequest,
+            HttpResponse existingBaseline,
+            MinimizationTarget target,
+            Function<HttpRequest, HttpResponse> requestSender,
+            AtomicBoolean cancelFlag,
+            ProgressListener listener,
+            ExecutorService requestExecutor) {
 
         ProgressListener safeListener = listener != null ? listener : new ProgressListener() {
         };
-        Run run = new Run(originalRequest, target, config.snapshot(), requestSender, cancelFlag, safeListener);
+        Run run = new Run(originalRequest, target, config.snapshot(), requestSender, cancelFlag,
+                safeListener, requestExecutor);
 
         MinimizationResult result;
         try {
@@ -122,6 +167,68 @@ public final class DeltaDebugMinimizer {
         return t.getClass().getSimpleName() + (message == null || message.isBlank() ? "" : ": " + message);
     }
 
+    /** Outcome of sending one test request (with its retry). {@code attempts == 0} means not sent. */
+    private record Sent(HttpResponse response, int attempts, String error) {
+        static final Sent NOT_SENT = new Sent(null, 0, null);
+    }
+
+    /** One test: send the request that keeps exactly {@code kept}. */
+    private static final class Check {
+        final Set<RemovableItem> kept;
+        final String description;
+        final boolean bypassMemo;
+        boolean passed;
+        boolean answered;
+
+        Check(Set<RemovableItem> kept, String description, boolean bypassMemo) {
+            this.kept = kept;
+            this.description = description;
+            this.bypassMemo = bypassMemo;
+        }
+    }
+
+    /** One part of a group known to contain at least one required item. */
+    private static final class Child {
+        final List<RemovableItem> items;
+        final String label;
+        Boolean clean;     // null while untested
+        Check check;       // set while scheduled in the current round
+        boolean applied;   // removal already applied
+
+        Child(List<RemovableItem> items, String label) {
+            this.items = items;
+            this.label = label;
+        }
+    }
+
+    /** The parts of a split group; at least one of them contains a required item. */
+    private static final class SiblingSet {
+        final List<Child> children;
+
+        SiblingSet(List<Child> children) {
+            this.children = children;
+        }
+
+        int unscheduledUntested() {
+            int count = 0;
+            for (Child child : children) {
+                if (child.clean == null && child.check == null) {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        Child firstUntested() {
+            for (Child child : children) {
+                if (child.clean == null && child.check == null) {
+                    return child;
+                }
+            }
+            return null;
+        }
+    }
+
     /** State of a single minimization run. */
     private final class Run {
         private final HttpRequest original;
@@ -130,67 +237,77 @@ public final class DeltaDebugMinimizer {
         private final Function<HttpRequest, HttpResponse> sender;
         private final AtomicBoolean cancelFlag;
         private final ProgressListener listener;
+        private final ExecutorService executor;
+        private final int parallelism;
 
         private final Map<Set<RemovableItem>, Boolean> memo = new HashMap<>();
-        private List<RemovableItem> allCandidates = List.of();
+        private final Set<Set<RemovableItem>> passedInLastRound = new HashSet<>();
+        private Prepared prepared;
+        private List<RemovableItem> all = List.of();
         private ResponseComparator comparator;
         private int requestCount;
+        private int rounds;
         private int consecutiveFailures;
+        private boolean anySent;
         private String lastSendError;
-        private boolean lastTestUnanswered;
-        private Set<RemovableItem> lastTestedSet;
-        private boolean lastTestPassed;
         private String abortReason;
+
+        // Search state
+        private final Set<RemovableItem> removed = new HashSet<>();
+        private final Deque<List<RemovableItem>> dirty = new ArrayDeque<>();
+        private final List<SiblingSet> siblingSets = new ArrayList<>();
+        private final Deque<RemovableItem> pool = new ArrayDeque<>();
+        private int requiredFound;
 
         Run(HttpRequest original,
             MinimizationTarget target,
             MinimizationConfig cfg,
             Function<HttpRequest, HttpResponse> sender,
             AtomicBoolean cancelFlag,
-            ProgressListener listener) {
+            ProgressListener listener,
+            ExecutorService executor) {
             this.original = original;
             this.target = target;
             this.cfg = cfg;
             this.sender = sender;
             this.cancelFlag = cancelFlag;
             this.listener = listener;
+            this.executor = executor;
+            this.parallelism = executor == null ? 1 : cfg.getEffectiveParallelism();
         }
 
         MinimizationResult execute(HttpResponse existingBaseline) {
-            allCandidates = List.copyOf(RequestMutator.extractCandidates(original, target, cfg));
-            listener.onStarted(original, target, allCandidates);
+            prepared = RequestMutator.prepare(original, target, cfg);
+            all = prepared.candidates();
+            listener.onStarted(original, target, all);
 
-            if (allCandidates.isEmpty()) {
+            if (all.isEmpty()) {
                 return failure("Nothing to minimize: this request has no removable " + target.itemNoun() + ".");
             }
 
-            // 1. Establish the baseline response.
-            HttpResponse baseline = existingBaseline;
-            if (baseline == null) {
-                if (cancelled()) {
-                    return stopped();
-                }
-                baseline = send(original);
+            // 1. Baseline, stability check and the "nothing required" fast path, together if possible.
+            Set<RemovableItem> everything = new LinkedHashSet<>(all);
+            Check stability = cfg.isVerifyBaselineStability()
+                    ? new Check(everything, "Stability check: original request again", true)
+                    : null;
+            Check empty = new Check(new LinkedHashSet<>(), "Without any candidate items", false);
+            List<Check> setupChecks = new ArrayList<>();
+            if (stability != null) {
+                setupChecks.add(stability);
             }
-            if (baseline == null) {
-                if (cancelled()) {
-                    return stopped();
-                }
-                return failure("No response received for the original request"
-                        + (lastSendError == null ? "." : " (" + lastSendError + ")."));
-            }
-            comparator = new ResponseComparator(baseline, cfg);
-            listener.onBaselineEstablished(comparator.getBaselineStatusCode(), comparator.getBaselineBodyLength());
+            setupChecks.add(empty);
 
-            // 2. Confirm the unmodified request reproduces the baseline. Without this, a response
-            //    that varies between identical requests would make every later comparison meaningless.
-            Set<RemovableItem> everything = new LinkedHashSet<>(allCandidates);
-            if (cfg.isVerifyBaselineStability()) {
-                if (!test(everything, "Stability check: original request again")) {
+            MinimizationResult setupFailure = establishBaseline(existingBaseline, setupChecks);
+            if (setupFailure != null) {
+                return setupFailure;
+            }
+
+            if (stability != null) {
+                if (!stability.passed) {
                     if (shouldStop()) {
                         return stopped();
                     }
-                    if (lastTestUnanswered) {
+                    if (!stability.answered) {
                         return failure("No response received when re-sending the original request"
                                 + (lastSendError == null ? "." : " (" + lastSendError + ")."));
                     }
@@ -201,24 +318,25 @@ public final class DeltaDebugMinimizer {
             } else {
                 memo.put(everything, Boolean.TRUE);
             }
+            if (shouldStop()) {
+                return stopped();
+            }
 
-            // 3. Fast path: nothing is required at all.
             List<RemovableItem> required;
-            if (test(Collections.emptySet(), "Without any candidate items")) {
+            if (empty.passed) {
                 required = List.of();
             } else {
-                // 4. Whole-category pruning when minimizing everything at once.
-                List<RemovableItem> active = target == MinimizationTarget.ALL
-                        ? pruneWholeCategories(allCandidates)
-                        : allCandidates;
+                // 2. Adaptive group testing.
+                search();
+                if (shouldStop()) {
+                    return stopped();
+                }
+                required = all.stream().filter(item -> !removed.contains(item)).toList();
 
-                // 5. QuickXplain binary search (the empty background is already known to fail).
-                required = quickXplain(Collections.emptySet(), active, true);
-
-                // 6. Confirm the result with a request sent now, at the end of the run. Earlier
+                // 3. Confirm the result with a request sent now, at the end of the run. Earlier
                 //    answers are not enough: if the session expired part-way through, every later
                 //    test fails and the search would wrongly conclude that everything is required.
-                if (!shouldStop() && !confirmStillWorks(new LinkedHashSet<>(required), "Verifying minimized request")) {
+                if (!confirmStillWorks(new LinkedHashSet<>(required), "Verifying minimized request")) {
                     if (shouldStop()) {
                         return stopped();
                     }
@@ -230,7 +348,7 @@ public final class DeltaDebugMinimizer {
                                 + " the start of the run (for example the session expired or a rate limit"
                                 + " was hit), so the result cannot be trusted. Nothing was saved.");
                     }
-                    required = eliminateOneByOne(active);
+                    required = eliminateOneByOne();
                 }
             }
 
@@ -238,24 +356,543 @@ public final class DeltaDebugMinimizer {
                 return stopped();
             }
 
-            Set<RemovableItem> requiredSet = new HashSet<>(required);
-            List<RemovableItem> orderedRequired = allCandidates.stream().filter(requiredSet::contains).toList();
-            HttpRequest minimizedRequest = RequestMutator.buildRequestWithSubset(
-                    original, target, new LinkedHashSet<>(orderedRequired), cfg);
-
+            HttpRequest minimizedRequest = prepared.build(new LinkedHashSet<>(required));
             MinimizationProfile profile = profileStore.createAndSaveProfile(
-                    original, minimizedRequest, target, allCandidates.size(), orderedRequired, requestCount);
+                    original, minimizedRequest, target, all.size(), required, requestCount);
 
             return new MinimizationResult(
-                    profile, original, minimizedRequest, allCandidates, orderedRequired, requestCount,
+                    profile, original, minimizedRequest, all, required, requestCount, rounds,
                     comparator.getBaselineStatusCode(), comparator.getBaselineBodyLength(), false, null);
         }
 
-        // --- Result helpers ------------------------------------------------------------------
+        /**
+         * Gets the baseline response and runs {@code setupChecks}. Everything goes out in one round
+         * when the parallelism allows; otherwise one request at a time, stopping early when the
+         * stability check fails. Returns a result only if the run must end here.
+         */
+        private MinimizationResult establishBaseline(HttpResponse existingBaseline, List<Check> setupChecks) {
+            HttpResponse baseline = existingBaseline;
+            boolean needBaseline = baseline == null;
+            int batchSize = setupChecks.size() + (needBaseline ? 1 : 0);
+
+            if (parallelism >= batchSize && batchSize > 1) {
+                List<HttpRequest> requests = new ArrayList<>();
+                if (needBaseline) {
+                    requests.add(original);
+                }
+                for (Check check : setupChecks) {
+                    requests.add(prepared.build(check.kept));
+                }
+                List<Sent> sent = sendBatch(requests);
+                beginRound();
+                int offset = 0;
+                if (needBaseline) {
+                    baseline = account(sent.get(0));
+                    offset = 1;
+                }
+                if (baseline == null) {
+                    for (int i = offset; i < sent.size(); i++) {
+                        account(sent.get(i));
+                    }
+                    return noBaseline();
+                }
+                setComparator(baseline);
+                for (int i = 0; i < setupChecks.size(); i++) {
+                    process(setupChecks.get(i), sent.get(offset + i));
+                }
+                return null;
+            }
+
+            if (needBaseline) {
+                if (cancelled()) {
+                    return stopped();
+                }
+                List<Sent> sent = sendBatch(List.of(original));
+                beginRound();
+                baseline = account(sent.get(0));
+                if (baseline == null) {
+                    return noBaseline();
+                }
+            }
+            setComparator(baseline);
+            for (Check check : setupChecks) {
+                runChecks(List.of(check));
+                if (!check.passed && check.bypassMemo) {
+                    break; // the stability check failed: no point sending anything else
+                }
+            }
+            return null;
+        }
+
+        private MinimizationResult noBaseline() {
+            if (cancelled()) {
+                return stopped();
+            }
+            return failure("No response received for the original request"
+                    + (lastSendError == null ? "." : " (" + lastSendError + ")."));
+        }
+
+        private void setComparator(HttpResponse baseline) {
+            comparator = new ResponseComparator(baseline, cfg);
+            listener.onBaselineEstablished(comparator.getBaselineStatusCode(), comparator.getBaselineBodyLength());
+        }
+
+        // --- Search --------------------------------------------------------------------------
+
+        private void search() {
+            List<List<RemovableItem>> categories = target == MinimizationTarget.ALL ? categoryGroups() : List.of();
+            if (categories.size() >= 2) {
+                // Whole categories first: headers are most often junk (Sec-*, Accept-*, User-Agent ...).
+                List<Child> children = new ArrayList<>();
+                for (List<RemovableItem> group : categories) {
+                    children.add(new Child(group, categoryLabel(group.get(0).category())));
+                }
+                siblingSets.add(new SiblingSet(children));
+            } else {
+                // "Remove everything" already failed, so the whole set holds a required item.
+                dirty.add(all);
+            }
+
+            // Every round classifies or splits at least one group, so this always terminates; the
+            // cap only guards against a defect turning into an endless stream of requests.
+            int maxRounds = 4 * all.size() + 32;
+            int searchRounds = 0;
+            while (!shouldStop()) {
+                while (!dirty.isEmpty()) {
+                    List<RemovableItem> group = dirty.poll();
+                    if (group.size() == 1) {
+                        requiredFound++;
+                    } else {
+                        siblingSets.add(split(group));
+                    }
+                }
+                if (siblingSets.isEmpty() && pool.isEmpty()) {
+                    return;
+                }
+                if (++searchRounds > maxRounds) {
+                    abortReason = "Stopped: the search did not converge. Please report this as a bug.";
+                    return;
+                }
+                runSearchRound();
+            }
+        }
+
+        private void runSearchRound() {
+            Set<RemovableItem> base = new LinkedHashSet<>();
+            for (RemovableItem item : all) {
+                if (!removed.contains(item)) {
+                    base.add(item);
+                }
+            }
+
+            int slots = parallelism;
+            List<Check> checks = new ArrayList<>();
+
+            // a) One part of every split group: these tests always make progress.
+            for (SiblingSet set : siblingSets) {
+                if (slots == 0) {
+                    break;
+                }
+                Child child = set.firstUntested();
+                if (child != null) {
+                    checks.add(schedule(child, base));
+                    slots--;
+                }
+            }
+            // b) With spare capacity, further parts of each split group, except the last untested
+            //    one: if every other part is clean, that one is known to hold the required item.
+            for (SiblingSet set : siblingSets) {
+                for (Child child : set.children) {
+                    if (slots > 0 && child.clean == null && child.check == null && set.unscheduledUntested() > 1) {
+                        checks.add(schedule(child, base));
+                        slots--;
+                    }
+                }
+            }
+            // c) Untested items, in groups sized for the density of required items seen so far.
+            List<List<RemovableItem>> probes = new ArrayList<>();
+            List<Check> probeChecks = new ArrayList<>();
+            if (slots > 0 && !pool.isEmpty()) {
+                int groupSize = poolGroupSize();
+                while (slots > 0 && !pool.isEmpty()) {
+                    List<RemovableItem> group = new ArrayList<>();
+                    while (group.size() < groupSize && !pool.isEmpty()) {
+                        group.add(pool.poll());
+                    }
+                    Check check = new Check(without(base, group), "Without " + group.size()
+                            + (group.size() == 1 ? " untested item" : " untested items"), false);
+                    probes.add(group);
+                    probeChecks.add(check);
+                    checks.add(check);
+                    slots--;
+                }
+            }
+
+            runChecks(checks);
+            if (shouldStop()) {
+                return;
+            }
+
+            for (SiblingSet set : new ArrayList<>(siblingSets)) {
+                for (Child child : set.children) {
+                    if (child.check != null) {
+                        child.clean = child.check.passed;
+                        child.check = null;
+                    }
+                }
+                if (resolve(set)) {
+                    siblingSets.remove(set);
+                }
+            }
+            for (int i = 0; i < probes.size(); i++) {
+                if (probeChecks.get(i).passed) {
+                    removed.addAll(probes.get(i));
+                } else {
+                    dirty.add(probes.get(i));
+                }
+            }
+        }
+
+        private Check schedule(Child child, Set<RemovableItem> base) {
+            String description = child.label != null
+                    ? "Without any " + child.label
+                    : "Without " + child.items.size() + (child.items.size() == 1 ? " item" : " items") + " (narrowing down)";
+            child.check = new Check(without(base, child.items), description, false);
+            return child.check;
+        }
+
+        /** Applies what is now known about a split group. Returns true once it is fully resolved. */
+        private boolean resolve(SiblingSet set) {
+            boolean anyRequired = false;
+            for (Child child : set.children) {
+                if (Boolean.TRUE.equals(child.clean) && !child.applied) {
+                    removed.addAll(child.items);
+                    child.applied = true;
+                }
+                if (Boolean.FALSE.equals(child.clean)) {
+                    anyRequired = true;
+                }
+            }
+            if (anyRequired) {
+                List<RemovableItem> untested = new ArrayList<>();
+                for (Child child : set.children) {
+                    if (Boolean.FALSE.equals(child.clean)) {
+                        dirty.add(child.items);
+                    } else if (child.clean == null) {
+                        untested.addAll(child.items);
+                    }
+                }
+                returnToPool(untested);
+                return true;
+            }
+
+            List<Child> untested = set.children.stream().filter(c -> c.clean == null).toList();
+            if (untested.size() == 1) {
+                // Everything else in the group is removable, so this part must hold the required item.
+                dirty.add(untested.get(0).items);
+                return true;
+            }
+            if (untested.isEmpty()) {
+                // Each part can go on its own, but not all of them at once (e.g. either of two
+                // cookies works). Keep the last part and narrow it down with the others removed.
+                Child last = set.children.get(set.children.size() - 1);
+                removed.removeAll(last.items);
+                dirty.add(last.items);
+                return true;
+            }
+            return false;
+        }
+
+        /**
+         * Splits a group known to hold a required item. Sending one request at a time, into halves
+         * (one test per level, the other half is inferred). With parallelism P, into P + 1 parts
+         * of which P are tested in the same round and the last is inferred, so each round narrows
+         * the group down by a factor of P + 1 instead of 2.
+         */
+        private SiblingSet split(List<RemovableItem> group) {
+            int size = group.size();
+            int parts = Math.min(size, parallelism > 1 ? parallelism + 1 : 2);
+            List<Child> children = new ArrayList<>(parts);
+            for (int i = 0; i < parts; i++) {
+                int from = (int) ((long) size * i / parts);
+                int to = (int) ((long) size * (i + 1) / parts);
+                children.add(new Child(List.copyOf(group.subList(from, to)), null));
+            }
+            return new SiblingSet(children);
+        }
+
+        /** Fraction of the items looked at so far that turned out to be required (0 if unknown). */
+        private double estimatedDensity() {
+            int knownRequired = requiredFound + dirty.size() + siblingSets.size();
+            int accounted = all.size() - pool.size();
+            return accounted <= 0 ? 0 : (double) knownRequired / accounted;
+        }
+
+        /** Hwang's group size for {@code n} items expected to hold {@code expected} required ones. */
+        private int hwangGroupSize(int n, double expected) {
+            double ratio = (n - expected + 1) / expected;
+            int size = ratio < 2 ? 1 : Integer.highestOneBit((int) ratio);
+            return Math.max(1, Math.min(size, n));
+        }
+
+        private void returnToPool(List<RemovableItem> items) {
+            for (int i = items.size() - 1; i >= 0; i--) {
+                pool.addFirst(items.get(i));
+            }
+        }
+
+        /**
+         * Group size for untested items, following Hwang's generalised binary splitting with the
+         * number of required items estimated from the density observed so far.
+         */
+        private int poolGroupSize() {
+            int poolSize = pool.size();
+            double expectedInPool = estimatedDensity() * poolSize;
+            if (expectedInPool <= 1.0) {
+                return poolSize; // probably nothing left to find: test the rest in one go
+            }
+            return hwangGroupSize(poolSize, expectedInPool);
+        }
+
+        private List<List<RemovableItem>> categoryGroups() {
+            List<List<RemovableItem>> groups = new ArrayList<>();
+            addCategory(groups, item -> item.category() == Category.HEADER);
+            addCategory(groups, item -> item.category().isParameter());
+            addCategory(groups, item -> item.category() == Category.COOKIE);
+            return groups;
+        }
+
+        private void addCategory(List<List<RemovableItem>> groups, Predicate<RemovableItem> inCategory) {
+            List<RemovableItem> group = all.stream().filter(inCategory).toList();
+            if (!group.isEmpty()) {
+                groups.add(group);
+            }
+        }
+
+        private String categoryLabel(Category category) {
+            return switch (category) {
+                case HEADER -> "headers";
+                case COOKIE -> "cookies";
+                default -> "parameters";
+            };
+        }
+
+        private Set<RemovableItem> without(Set<RemovableItem> base, List<RemovableItem> group) {
+            Set<RemovableItem> kept = new LinkedHashSet<>(base);
+            group.forEach(kept::remove);
+            return kept;
+        }
+
+        /**
+         * Fallback: starting from the original request (just confirmed to work), drop items one at
+         * a time and keep each removal that still reproduces the baseline. Every state it settles
+         * on has been observed to work, so the result is verified by construction.
+         */
+        private List<RemovableItem> eliminateOneByOne() {
+            List<RemovableItem> current = new ArrayList<>(all);
+            for (RemovableItem item : all) {
+                if (shouldStop()) {
+                    break;
+                }
+                List<RemovableItem> trial = new ArrayList<>(current);
+                trial.remove(item);
+                Check check = new Check(new LinkedHashSet<>(trial), "Fallback: without one more item", true);
+                runChecks(List.of(check));
+                if (check.passed) {
+                    current = trial;
+                }
+            }
+            return current;
+        }
+
+        // --- Sending and testing -------------------------------------------------------------
+
+        /**
+         * Like a normal check but never answers from memory, unless {@code kept} is exactly what a
+         * request in the most recent round already confirmed.
+         */
+        private boolean confirmStillWorks(Set<RemovableItem> kept, String description) {
+            if (shouldStop()) {
+                return false;
+            }
+            if (passedInLastRound.contains(kept)) {
+                return true;
+            }
+            Check check = new Check(kept, description, true);
+            runChecks(List.of(check));
+            return check.passed;
+        }
+
+        /** Sends every check that is not already answered from memory, all in one round. */
+        private void runChecks(List<Check> checks) {
+            if (shouldStop()) {
+                return;
+            }
+            List<Check> toSend = new ArrayList<>();
+            for (Check check : checks) {
+                Boolean cached = check.bypassMemo ? null : memo.get(check.kept);
+                if (cached != null) {
+                    check.passed = cached;
+                    check.answered = true;
+                } else {
+                    toSend.add(check);
+                }
+            }
+            if (toSend.isEmpty()) {
+                return;
+            }
+            List<HttpRequest> requests = new ArrayList<>(toSend.size());
+            for (Check check : toSend) {
+                requests.add(prepared.build(check.kept));
+            }
+            List<Sent> sent = sendBatch(requests);
+            beginRound();
+            for (int i = 0; i < toSend.size(); i++) {
+                process(toSend.get(i), sent.get(i));
+            }
+        }
+
+        private void beginRound() {
+            rounds++;
+            passedInLastRound.clear();
+        }
+
+        /** Records the outcome of one test request (on the run's own thread, in a fixed order). */
+        private void process(Check check, Sent sent) {
+            HttpResponse response = account(sent);
+            if (sent.attempts() == 0) {
+                check.passed = false; // never sent because the run is stopping
+                return;
+            }
+            check.answered = response != null;
+            if (response == null) {
+                if (!cancelled() && ++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES && abortReason == null) {
+                    abortReason = "Stopped: the target did not respond to " + MAX_CONSECUTIVE_FAILURES
+                            + " test requests in a row" + (lastSendError == null ? "." : " (" + lastSendError + ").");
+                }
+            } else {
+                consecutiveFailures = 0;
+            }
+
+            boolean passed = response != null && comparator.isEquivalent(response);
+            check.passed = passed;
+            Set<RemovableItem> key = new HashSet<>(check.kept);
+            memo.put(key, passed);
+            if (passed) {
+                passedInLastRound.add(key);
+            }
+
+            listener.onStep(new StepLog(
+                    requestCount,
+                    rounds,
+                    response == null ? check.description + " (no response)" : check.description,
+                    check.kept.size(),
+                    all.size(),
+                    response == null ? 0 : response.statusCode(),
+                    ResponseComparator.bodyLength(response),
+                    passed));
+        }
+
+        /** Adds a sent request to the run's totals and returns its response. */
+        private HttpResponse account(Sent sent) {
+            requestCount += sent.attempts();
+            if (sent.error() != null) {
+                lastSendError = sent.error();
+            }
+            return sent.response();
+        }
+
+        /**
+         * Sends the requests, in parallel when allowed. Results come back in the same order. Runs
+         * no state-changing code on the worker threads.
+         */
+        private List<Sent> sendBatch(List<HttpRequest> requests) {
+            List<Sent> results = new ArrayList<>(requests.size());
+            if (executor == null || parallelism <= 1 || requests.size() == 1) {
+                for (HttpRequest request : requests) {
+                    results.add(pauseBeforeSending() ? sendWithRetry(request) : Sent.NOT_SENT);
+                }
+                return results;
+            }
+
+            List<Future<Sent>> futures = new ArrayList<>(requests.size());
+            try {
+                for (HttpRequest request : requests) {
+                    futures.add(executor.submit(() -> cancelled() ? Sent.NOT_SENT : sendWithRetry(request)));
+                }
+            } catch (RejectedExecutionException e) {
+                // The extension is unloading.
+                futures.forEach(f -> f.cancel(true));
+                requests.forEach(r -> results.add(Sent.NOT_SENT));
+                return results;
+            }
+            anySent = true;
+
+            boolean interrupted = false;
+            for (Future<Sent> future : futures) {
+                if (interrupted) {
+                    future.cancel(true);
+                    results.add(Sent.NOT_SENT);
+                    continue;
+                }
+                try {
+                    results.add(future.get());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    interrupted = true;
+                    future.cancel(true);
+                    results.add(Sent.NOT_SENT);
+                } catch (ExecutionException e) {
+                    results.add(new Sent(null, 1, describe(e.getCause() != null ? e.getCause() : e)));
+                } catch (CancellationException e) {
+                    results.add(Sent.NOT_SENT);
+                }
+            }
+            return results;
+        }
+
+        /** Applies the configured delay between requests. Returns false if the run should stop. */
+        private boolean pauseBeforeSending() {
+            if (cancelled()) {
+                return false;
+            }
+            int delay = cfg.getRequestDelayMs();
+            if (delay > 0 && anySent) {
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            anySent = true;
+            return !cancelled();
+        }
+
+        /** Sends a request, retrying once so a single network blip cannot skew the result. */
+        private Sent sendWithRetry(HttpRequest request) {
+            Sent first = sendOnce(request);
+            if (first.response() != null || cancelled()) {
+                return first;
+            }
+            Sent second = sendOnce(request);
+            return new Sent(second.response(), 2, second.error() != null ? second.error() : first.error());
+        }
+
+        private Sent sendOnce(HttpRequest request) {
+            try {
+                HttpResponse response = sender.apply(request);
+                return new Sent(response, 1, response == null ? "no response" : null);
+            } catch (RuntimeException e) {
+                return new Sent(null, 1, describe(e));
+            }
+        }
+
+        // --- Results -------------------------------------------------------------------------
 
         MinimizationResult failure(String message) {
             return new MinimizationResult(
-                    null, original, original, allCandidates, List.of(), requestCount,
+                    null, original, original, all, List.of(), requestCount, rounds,
                     comparator == null ? (short) 0 : comparator.getBaselineStatusCode(),
                     comparator == null ? 0 : comparator.getBaselineBodyLength(),
                     false, message);
@@ -267,7 +904,7 @@ public final class DeltaDebugMinimizer {
                 return failure(abortReason);
             }
             return new MinimizationResult(
-                    null, original, original, allCandidates, List.of(), requestCount,
+                    null, original, original, all, List.of(), requestCount, rounds,
                     comparator == null ? (short) 0 : comparator.getBaselineStatusCode(),
                     comparator == null ? 0 : comparator.getBaselineBodyLength(),
                     true, null);
@@ -279,195 +916,6 @@ public final class DeltaDebugMinimizer {
 
         private boolean shouldStop() {
             return abortReason != null || cancelled();
-        }
-
-        // --- Sending and testing -------------------------------------------------------------
-
-        private HttpResponse send(HttpRequest request) {
-            requestCount++;
-            try {
-                HttpResponse response = sender.apply(request);
-                if (response == null) {
-                    lastSendError = "no response";
-                }
-                return response;
-            } catch (RuntimeException e) {
-                lastSendError = describe(e);
-                return null;
-            }
-        }
-
-        /**
-         * Sends the request that keeps exactly {@code kept} and reports whether its response is
-         * equivalent to the baseline. Results are memoized; a stopped run always answers false.
-         */
-        private boolean test(Set<RemovableItem> kept, String description) {
-            if (shouldStop()) {
-                return false;
-            }
-            Boolean cached = memo.get(kept);
-            if (cached != null) {
-                return cached;
-            }
-            return sendAndCompare(kept, description);
-        }
-
-        /**
-         * Like {@link #test} but never answers from memory, unless {@code kept} is exactly what the
-         * most recent request already confirmed.
-         */
-        private boolean confirmStillWorks(Set<RemovableItem> kept, String description) {
-            if (shouldStop()) {
-                return false;
-            }
-            if (lastTestPassed && kept.equals(lastTestedSet)) {
-                return true;
-            }
-            return sendAndCompare(kept, description);
-        }
-
-        private boolean sendAndCompare(Set<RemovableItem> kept, String description) {
-            int delay = cfg.getRequestDelayMs();
-            if (delay > 0 && requestCount > 0) {
-                try {
-                    Thread.sleep(delay);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
-            }
-
-            HttpRequest testRequest = RequestMutator.buildRequestWithSubset(original, target, kept, cfg);
-            HttpResponse response = send(testRequest);
-            if (response == null && !cancelled()) {
-                response = send(testRequest); // one retry so a single network blip cannot skew the result
-            }
-            int step = requestCount;
-            lastTestUnanswered = response == null;
-
-            if (response == null) {
-                if (cancelled()) {
-                    return false;
-                }
-                if (++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                    abortReason = "Stopped: the target did not respond to " + MAX_CONSECUTIVE_FAILURES
-                            + " test requests in a row" + (lastSendError == null ? "." : " (" + lastSendError + ").");
-                }
-            } else {
-                consecutiveFailures = 0;
-            }
-
-            boolean passed = response != null && comparator.isEquivalent(response);
-            Set<RemovableItem> key = new HashSet<>(kept);
-            memo.put(key, passed);
-            lastTestedSet = key;
-            lastTestPassed = passed;
-
-            listener.onStep(new StepLog(
-                    step,
-                    response == null ? description + " (no response)" : description,
-                    kept.size(),
-                    allCandidates.size(),
-                    response == null ? 0 : response.statusCode(),
-                    ResponseComparator.bodyLength(response),
-                    passed));
-            return passed;
-        }
-
-        // --- Search --------------------------------------------------------------------------
-
-        /**
-         * In ALL mode, checks whether entire categories (all headers, all parameters, or all
-         * cookies) can be dropped in a single step before binary-searching individual items.
-         */
-        private List<RemovableItem> pruneWholeCategories(List<RemovableItem> candidates) {
-            List<RemovableItem> current = candidates;
-            // Headers first: they are most often junk (Sec-*, Accept-*, User-Agent ...).
-            current = pruneCategory(current, i -> i.category() == Category.HEADER, "Without any headers");
-            current = pruneCategory(current, i -> i.category().isParameter(), "Without any parameters");
-            current = pruneCategory(current, i -> i.category() == Category.COOKIE, "Without any cookies");
-            return current;
-        }
-
-        private List<RemovableItem> pruneCategory(
-                List<RemovableItem> current,
-                Predicate<RemovableItem> inCategory,
-                String description) {
-            List<RemovableItem> without = current.stream().filter(inCategory.negate()).toList();
-            // Dropping everything is the fast path already known to fail, so skip an empty result.
-            if (without.size() == current.size() || without.isEmpty()) {
-                return current;
-            }
-            return test(new LinkedHashSet<>(without), description) ? without : current;
-        }
-
-        /**
-         * QuickXplain: finds a minimal R within {@code candidates} such that
-         * test(background + R) passes, given that test(background + candidates) passes.
-         *
-         * @param background          Items currently held fixed in the request
-         * @param candidates          Candidate items being partitioned
-         * @param backgroundKnownFail True if test(background) is already known to fail
-         */
-        private List<RemovableItem> quickXplain(
-                Set<RemovableItem> background,
-                List<RemovableItem> candidates,
-                boolean backgroundKnownFail) {
-
-            if (candidates.isEmpty() || shouldStop()) {
-                return Collections.emptyList();
-            }
-            if (!backgroundKnownFail && test(background, describeProbe(background))) {
-                // The background alone succeeds, so nothing in this branch is needed.
-                return Collections.emptyList();
-            }
-            if (candidates.size() == 1) {
-                return List.of(candidates.get(0));
-            }
-
-            int mid = candidates.size() / 2;
-            List<RemovableItem> c1 = candidates.subList(0, mid);
-            List<RemovableItem> c2 = candidates.subList(mid, candidates.size());
-
-            // Hold C1 in the background and find what is required from C2.
-            Set<RemovableItem> backgroundWithC1 = new LinkedHashSet<>(background);
-            backgroundWithC1.addAll(c1);
-            List<RemovableItem> r2 = quickXplain(backgroundWithC1, c2, false);
-
-            // Hold R2 in the background and find what is required from C1. If R2 is empty this
-            // background equals the one we were called with, which is already known to fail.
-            Set<RemovableItem> backgroundWithR2 = new LinkedHashSet<>(background);
-            backgroundWithR2.addAll(r2);
-            List<RemovableItem> r1 = quickXplain(backgroundWithR2, c1, r2.isEmpty());
-
-            List<RemovableItem> combined = new ArrayList<>(r1.size() + r2.size());
-            combined.addAll(r1);
-            combined.addAll(r2);
-            return combined;
-        }
-
-        private String describeProbe(Set<RemovableItem> kept) {
-            return "Testing " + kept.size() + " of " + allCandidates.size() + " items";
-        }
-
-        /**
-         * Fallback: starting from a set known to work, drop items one at a time and keep each
-         * removal that still reproduces the baseline. Every state it settles on has been observed
-         * to work, so the result is verified by construction.
-         */
-        private List<RemovableItem> eliminateOneByOne(List<RemovableItem> knownGood) {
-            List<RemovableItem> current = new ArrayList<>(knownGood);
-            for (RemovableItem item : knownGood) {
-                if (shouldStop()) {
-                    break;
-                }
-                List<RemovableItem> trial = new ArrayList<>(current);
-                trial.remove(item);
-                if (test(new LinkedHashSet<>(trial), "Fallback: without one more item")) {
-                    current = trial;
-                }
-            }
-            return current;
         }
     }
 }
