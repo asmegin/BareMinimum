@@ -1,0 +1,22 @@
+# Gradle
+.gradle/
+build/
+
+# IDE output and settings
+bin/
+out/
+.idea/
+.vscode/
+.settings/
+.classpath
+.project
+*.iml
+*.iws
+*.ipr
+
+# Local tooling
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
