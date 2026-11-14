@@ -132,4 +132,18 @@ class ModelTest {
         config.setMatchBodyLength(false);
         assertFalse(config.isMatchBodyLength());
     }
+
+    @Test
+    void responseMatchingDefaultsToRulesAndIsCopiedBySnapshots() {
+        MinimizationConfig config = new MinimizationConfig();
+        assertEquals(MinimizationConfig.ResponseMatching.RULES, config.getResponseMatching());
+
+        config.setResponseMatching(MinimizationConfig.ResponseMatching.BURP_ANALYSIS);
+        MinimizationConfig snapshot = config.snapshot();
+        config.setResponseMatching(null);
+
+        assertEquals(MinimizationConfig.ResponseMatching.RULES, config.getResponseMatching());
+        assertEquals(MinimizationConfig.ResponseMatching.BURP_ANALYSIS, snapshot.getResponseMatching());
+        assertTrue(new RemovableItem(RemovableItem.Category.XML_PARAM, "a/b", "", 0).category().isParameter());
+    }
 }

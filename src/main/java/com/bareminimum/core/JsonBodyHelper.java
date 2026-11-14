@@ -1,7 +1,9 @@
 package com.bareminimum.core;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -18,6 +20,12 @@ import java.util.regex.Pattern;
  * <p>Fields keep their raw source text, so rebuilding an object never re-encodes a key or value.
  */
 public final class JsonBodyHelper {
+
+    /**
+     * Paths are only worked out this deep. Deeper members still parse, but nobody offers them for
+     * removal, and building ever-longer paths for pathological nesting would take quadratic memory.
+     */
+    public static final int PATH_DEPTH_LIMIT = 64;
 
     private static final Pattern PRIMITIVE =
             Pattern.compile("-?(?:0|[1-9]\\d*)(?:\\.\\d+)?(?:[eE][+-]?\\d+)?|true|false|null");
@@ -127,6 +135,239 @@ public final class JsonBodyHelper {
             sb.append(renderField(field));
         }
         return sb.append('}').toString();
+    }
+
+    // --- Full tree, for minimizing nested members ------------------------------------------
+
+    /**
+     * One member of a JSON document below the root: an object member or an array element.
+     * Nodes are listed in document order, so a node's descendants directly follow it.
+     */
+    public static final class Node {
+        /** Display path, e.g. {@code user.address.city} or {@code items[2].id}; null below {@link #PATH_DEPTH_LIMIT}. */
+        public final String path;
+        /** The key exactly as written between its quotes, or null for an array element. */
+        public final String rawKey;
+        /** Index of the enclosing member in {@link Tree#nodes()}, or -1 for a member of the root. */
+        public final int parent;
+        /** 1 for members of the root, 2 for their members, and so on. */
+        public final int depth;
+        public final int valueStart;
+        int valueEnd;
+
+        Node(String path, String rawKey, int parent, int depth, int valueStart) {
+            this.path = path;
+            this.rawKey = rawKey;
+            this.parent = parent;
+            this.depth = depth;
+            this.valueStart = valueStart;
+        }
+
+        public int valueEnd() {
+            return valueEnd;
+        }
+    }
+
+    /** A parsed JSON document whose root is an object or an array. */
+    public record Tree(String text, int rootStart, int rootEnd, List<Node> nodes) {
+
+        public String rawValue(Node node) {
+            return text.substring(node.valueStart, node.valueEnd);
+        }
+
+        /**
+         * Writes the document back out without the {@code removed} nodes (and everything inside
+         * them). Containers with nothing removed inside them are copied verbatim; a container that
+         * lost members is rewritten as {@code "key": value} pairs separated by {@code ", "}.
+         */
+        public String render(boolean[] removed) {
+            int count = nodes.size();
+            boolean[] changedBelow = new boolean[count];
+            boolean rootChanged = false;
+            List<List<Integer>> children = new ArrayList<>(count);
+            List<Integer> rootChildren = new ArrayList<>();
+            for (int k = 0; k < count; k++) {
+                children.add(null);
+            }
+            for (int k = 0; k < count; k++) {
+                int parent = nodes.get(k).parent;
+                if (parent < 0) {
+                    rootChildren.add(k);
+                } else {
+                    List<Integer> list = children.get(parent);
+                    if (list == null) {
+                        list = new ArrayList<>();
+                        children.set(parent, list);
+                    }
+                    list.add(k);
+                }
+            }
+            for (int k = count - 1; k >= 0; k--) {
+                if (removed[k] || changedBelow[k]) {
+                    int parent = nodes.get(k).parent;
+                    if (parent < 0) {
+                        rootChanged = true;
+                    } else {
+                        changedBelow[parent] = true;
+                    }
+                }
+            }
+            if (!rootChanged) {
+                return text;
+            }
+            StringBuilder sb = new StringBuilder(text.length());
+            sb.append(text, 0, rootStart);
+            renderContainer(sb, text.charAt(rootStart), rootChildren, removed, changedBelow, children);
+            sb.append(text, rootEnd, text.length());
+            return sb.toString();
+        }
+
+        private void renderContainer(StringBuilder sb, char open, List<Integer> members,
+                                     boolean[] removed, boolean[] changedBelow, List<List<Integer>> children) {
+            sb.append(open);
+            boolean first = true;
+            for (int k : members == null ? List.<Integer>of() : members) {
+                if (removed[k]) {
+                    continue;
+                }
+                if (!first) {
+                    sb.append(", ");
+                }
+                first = false;
+                Node node = nodes.get(k);
+                if (node.rawKey != null) {
+                    sb.append('"').append(node.rawKey).append("\": ");
+                }
+                if (changedBelow[k]) {
+                    // Only reached for containers holding a removed member, so recursion depth is
+                    // bounded by the depth of the removable members, not by the document.
+                    renderContainer(sb, text.charAt(node.valueStart), children.get(k), removed, changedBelow, children);
+                } else {
+                    sb.append(text, node.valueStart, node.valueEnd);
+                }
+            }
+            sb.append(open == '{' ? '}' : ']');
+        }
+    }
+
+    private static final class Frame {
+        final boolean object;
+        final int node;      // -1 for the root
+        final String path;   // "" for the root, null below PATH_DEPTH_LIMIT
+        int count;
+        boolean expectMember = true; // after '{', '[' or ','
+
+        Frame(boolean object, int node, String path) {
+            this.object = object;
+            this.node = node;
+            this.path = path;
+        }
+    }
+
+    /**
+     * Parses a whole JSON document whose root is an object or an array. Returns null if the input
+     * is not well-formed. Iterative, so arbitrarily deep nesting cannot exhaust the stack.
+     */
+    public static Tree parseTree(String json) {
+        if (json == null) {
+            return null;
+        }
+        final int n = json.length();
+        int i = skipWhitespace(json, 0, n);
+        if (i >= n || (json.charAt(i) != '{' && json.charAt(i) != '[')) {
+            return null;
+        }
+        int rootStart = i;
+        List<Node> nodes = new ArrayList<>();
+        Deque<Frame> stack = new ArrayDeque<>();
+        stack.push(new Frame(json.charAt(i) == '{', -1, ""));
+        i++;
+
+        while (true) {
+            Frame frame = stack.peek();
+            i = skipWhitespace(json, i, n);
+            if (i >= n) {
+                return null;
+            }
+            char c = json.charAt(i);
+            char close = frame.object ? '}' : ']';
+
+            if (c == close && (frame.count == 0 || !frame.expectMember)) {
+                // "{}" / "[]", or the end after a member (a trailing comma is rejected above).
+                stack.pop();
+                if (frame.node >= 0) {
+                    nodes.get(frame.node).valueEnd = i + 1;
+                }
+                i++;
+                if (stack.isEmpty()) {
+                    return skipWhitespace(json, i, n) == n ? new Tree(json, rootStart, i, List.copyOf(nodes)) : null;
+                }
+                stack.peek().expectMember = false;
+                continue;
+            }
+            if (!frame.expectMember) {
+                if (c != ',') {
+                    return null;
+                }
+                frame.expectMember = true;
+                i++;
+                continue;
+            }
+
+            // A member: "key": value for objects, value for arrays.
+            String rawKey = null;
+            String path;
+            if (frame.object) {
+                if (c != '"') {
+                    return null;
+                }
+                int keyEnd = findStringEnd(json, i, n);
+                if (keyEnd < 0) {
+                    return null;
+                }
+                rawKey = json.substring(i + 1, keyEnd);
+                if (frame.path == null || stack.size() > PATH_DEPTH_LIMIT) {
+                    path = null;
+                } else {
+                    String key = unescape(rawKey);
+                    path = frame.path.isEmpty() ? key : frame.path + "." + key;
+                }
+                i = skipWhitespace(json, keyEnd + 1, n);
+                if (i >= n || json.charAt(i) != ':') {
+                    return null;
+                }
+                i = skipWhitespace(json, i + 1, n);
+                if (i >= n) {
+                    return null;
+                }
+            } else {
+                path = frame.path == null || stack.size() > PATH_DEPTH_LIMIT ? null : frame.path + "[" + frame.count + "]";
+            }
+            frame.count++;
+            frame.expectMember = false;
+
+            int index = nodes.size();
+            Node node = new Node(path, rawKey, frame.node, stack.size(), i);
+            nodes.add(node);
+            char first = json.charAt(i);
+            if (first == '{' || first == '[') {
+                stack.push(new Frame(first == '{', index, path));
+                i++;
+                continue;
+            }
+            int valueEnd;
+            if (first == '"') {
+                int endQuote = findStringEnd(json, i, n);
+                valueEnd = endQuote < 0 ? -1 : endQuote + 1;
+            } else {
+                valueEnd = findValueEnd(json, i, n);
+            }
+            if (valueEnd <= i) {
+                return null;
+            }
+            node.valueEnd = valueEnd;
+            i = valueEnd;
+        }
     }
 
     private static boolean isJsonWhitespace(char c) {

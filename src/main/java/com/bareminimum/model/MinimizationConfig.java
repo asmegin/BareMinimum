@@ -20,6 +20,29 @@ public final class MinimizationConfig {
     public static final int DEFAULT_PARALLELISM = 4;
     public static final int MAX_PARALLELISM = 16;
 
+    /** How a test response is judged to still match the baseline. */
+    public enum ResponseMatching {
+        /** The status, length, JSON-key and substring rules below. */
+        RULES("Rules below (status code, body length, JSON keys)"),
+        /**
+         * Burp's own response analysis: the original request is sent several times to learn which
+         * response attributes (status, content type, page title, word count, visible text, tag
+         * structure ...) stay the same, and a test response must keep all of those.
+         */
+        BURP_ANALYSIS("Burp's response analysis (learns what stays the same)");
+
+        private final String label;
+
+        ResponseMatching(String label) {
+            this.label = label;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
     private volatile boolean matchStatusCode = true;
     private volatile boolean matchBodyLength = true;
     private volatile double bodyLengthTolerancePercent = 5.0;
@@ -30,6 +53,7 @@ public final class MinimizationConfig {
     private volatile Set<String> pinnedHeaders = defaultPinnedHeaders();
     private volatile int requestDelayMs = 0;
     private volatile int parallelism = DEFAULT_PARALLELISM;
+    private volatile ResponseMatching responseMatching = ResponseMatching.RULES;
     private volatile Runnable changeListener;
 
     public static Set<String> defaultPinnedHeaders() {
@@ -54,6 +78,7 @@ public final class MinimizationConfig {
         copy.pinnedHeaders = pinnedHeaders;
         copy.requestDelayMs = requestDelayMs;
         copy.parallelism = parallelism;
+        copy.responseMatching = responseMatching;
         return copy;
     }
 
@@ -186,6 +211,15 @@ public final class MinimizationConfig {
 
     public void setParallelism(int parallelism) {
         this.parallelism = Math.max(1, Math.min(MAX_PARALLELISM, parallelism));
+        changed();
+    }
+
+    public ResponseMatching getResponseMatching() {
+        return responseMatching;
+    }
+
+    public void setResponseMatching(ResponseMatching responseMatching) {
+        this.responseMatching = responseMatching == null ? ResponseMatching.RULES : responseMatching;
         changed();
     }
 

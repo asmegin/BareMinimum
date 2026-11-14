@@ -11,7 +11,8 @@ It works in both Burp Suite Professional and Burp Suite Community Edition.
 - **Finds the required items quickly.** Instead of removing items one at a time, BareMinimum removes whole groups and narrows down only the groups that turn out to matter (adaptive group testing). It adjusts the group size to how many required items it has found so far, so it is fast when most items are junk and stays close to one-at-a-time cost when most are required. See [Performance](#performance).
 - **Sends independent tests in parallel** (4 at a time by default), so a search takes a fraction of the waiting time.
 - **Handles items that only work together** (a CSRF cookie and its matching header) **and alternatives** (either of two session cookies is enough).
-- **Covers cookies, headers, URL query parameters, form bodies** (`application/x-www-form-urlencoded` and `multipart/form-data`) **and top-level JSON fields.**
+- **Covers cookies, headers, URL query parameters, form bodies** (`application/x-www-form-urlencoded` and `multipart/form-data`), **JSON bodies at any depth** (object members and array elements) **and XML bodies** (elements and attributes, for example SOAP).
+- **Two ways to judge a response**: simple rules (status code, body length, JSON keys, required and forbidden strings), or **Burp's own response analysis**, which learns which response attributes stay the same and ignores the parts that change on every request.
 - **Saves each result as a reusable profile** (for example `GET - ALL 1`). A profile records the *names* that were required, so you can apply it to a later request to the same endpoint and keep that request's own, current values.
 - **Leaves what it keeps untouched.** Kept cookies, headers and parameters are copied from the original request exactly as they were. Nothing is decoded or re-encoded.
 
@@ -20,16 +21,15 @@ It works in both Burp Suite Professional and Burp Suite Community Edition.
 The BApp Store already contains [Request Minimizer](https://portswigger.net/bappstore/cc16f37549ff416b990d4312490f5fd1), which has the same basic purpose. What BareMinimum adds:
 
 - **Speed.** Request Minimizer removes items one at a time, sending one request after another. BareMinimum needs far fewer requests when most items are junk, and sends independent tests in parallel. On a request with 40 cookies of which 2 matter, that is about 18 requests in 6 round trips instead of 42 in 42.
-- **JSON requests keep their other minimizations.** Request Minimizer rebuilds JSON requests from the original headers, which discards the cookie, header and URL parameter removals it has just made, and re-formats the JSON. BareMinimum keeps everything it does not remove byte-for-byte.
+- **Nested JSON and XML bodies are searched the same fast way.** Request Minimizer removes nested keys one at a time; BareMinimum tests nested members in groups like everything else, and removing a container takes everything inside it in a single request.
+- **Bodies keep their original form.** Request Minimizer re-serializes the whole body (re-indented JSON, XML rewritten by a converter), and rebuilds the request from the original headers, which discards the cookie, header and URL parameter removals it has just made. BareMinimum copies everything it keeps byte-for-byte, including XML comments, namespace declarations and attribute order.
+- **Response analysis plus your own rules.** Both tools can use Burp's response analysis; BareMinimum learns from three responses instead of two, so an attribute that matched by chance is less likely to be treated as fixed, and still applies your status code and required/forbidden string rules on top. Rule-based matching is available as well.
 - **Single JAR.** No Jython setup and no extra Python packages to install.
 - **A choice of scope**: cookies, headers, parameters, or all of them.
 - **Reusable profiles**: a result is saved by name and can be applied to other requests later.
-- **Configurable matching**: status code, body length tolerance, JSON key structure, required and forbidden strings.
 - **Final confirmation**: the minimized request is re-sent at the end, so an expired session cannot produce a wrong result.
 - **Progress, cancel and undo**: a live step log, a **Cancel Run** button, and a request editor tab with an item checklist and **Restore Original**.
 - **Works from anywhere**, including Proxy history and the site map, not just editable request editors.
-
-Request Minimizer is currently better at two things: it minimizes nested JSON and XML bodies (BareMinimum only does top-level JSON fields), and it compares responses using Burp's built-in response analysis, which adapts automatically to pages that vary.
 
 ## Important: this extension sends requests
 
@@ -49,7 +49,7 @@ Right-click a request anywhere in Burp (Proxy history, Repeater, Site map, …) 
 |---|---|
 | **Find required cookies** | Searches the cookies in the `Cookie` header |
 | **Find required headers** | Searches the request headers, except pinned ones |
-| **Find required parameters** | Searches URL, body and top-level JSON parameters |
+| **Find required parameters** | Searches URL parameters, form fields, and JSON and XML body items |
 | **Find required ALL** | Searches all three together |
 | **Minimize Request [profile]** | Applies the active profile to this request |
 | *Saved results* | Click a saved profile to make it the active one |
@@ -75,7 +75,9 @@ Every request editor has a **BareMinimum** tab next to Pretty / Raw / Hex.
 
 ## How "still works" is decided
 
-A test response counts as equivalent to the original when it passes every enabled rule:
+**Response matching** offers two modes.
+
+**Rules** (the default). A test response counts as equivalent to the original when it passes every enabled rule:
 
 | Rule | Default |
 |---|---|
@@ -85,9 +87,11 @@ A test response counts as equivalent to the original when it passes every enable
 | Response contains a given string | Off |
 | Response does not contain a given string (for example `Unauthorized`) | Off |
 
+**Burp's response analysis.** The original request is sent 3 times. Burp computes a set of attributes for each response: status code, content type, page title, word and line counts, visible text, tag and cookie names, and more. The attributes that came out the same all 3 times must also be the same in every test response; those that changed (a timestamp, a nonce, a CSRF token) are ignored. `Last-Modified` is always ignored, as in Burp's own tools. The status code and required/forbidden string rules still apply. The body length and JSON key rules do not, and the stability check is built in. Use this mode for pages that change on every request.
+
 Other settings:
 
-- **Stability check** (on by default) — sends the original request a second time before searching. If the two responses do not match each other under your rules, the run stops and tells you, because no comparison would be reliable. Loosen the rules or add a required string and try again.
+- **Stability check** (rules mode, on by default) — sends the original request a second time before searching. If the two responses do not match each other under your rules, the run stops and tells you, because no comparison would be reliable. Loosen the rules, add a required string, or switch to Burp's response analysis, and try again.
 - **Pinned headers** — headers that are never removed. `Host` and `Content-Length` are always pinned.
 - **Delay between requests** — for rate-limited targets. Any delay means requests go one at a time.
 - **Parallel requests** (default 4, up to 16) — how many test requests may be in flight at once. 1 sends them one after another.
@@ -99,6 +103,8 @@ At the end of each search BareMinimum sends the minimized request once more to c
 ## Performance
 
 Each test request removes a group of items and asks whether anything in that group is needed. A group that comes back clean is dropped in one go; a group that breaks the request is split and narrowed down. This is Hwang's generalised binary splitting, with the group size chosen from how dense the required items have been so far. With *P* parallel requests, a group is split into *P* + 1 parts and *P* of them are tested at once, so each round narrows it down *P* + 1 times instead of twice.
+
+Nested JSON and XML members are searched the same way. Removing a container also removes everything inside it, so once a container is known to be junk, its contents are dropped without sending any more requests.
 
 Request counts include the baseline, the stability check and the final confirmation. A *round* is one batch of requests sent together, so rounds are what you wait for. Removing items one at a time costs 2 + *n* requests, sent one after another.
 
@@ -121,9 +127,11 @@ When nearly everything is required, BareMinimum sends a few more requests than o
 
 ## Limitations
 
-- JSON minimization covers the top-level fields of a JSON object. Nested fields, JSON arrays and XML bodies are left alone.
+- In JSON and XML bodies, the first 1,000 items, up to 32 levels deep, are offered for removal. Anything beyond that is kept as it is.
+- When a JSON container loses members, it is written out again in compact form (`"key": value` pairs separated by `, `). Containers that lose nothing stay exactly as they were.
+- XML namespace declarations are never removed. The XML reader does not process DTDs or expand entities (by design), so a document that relies on entities declared in its DTD is minimized as plain text around them.
 - Request targets with a `#fragment` are not treated specially.
-- A response that legitimately varies a lot between identical requests needs looser matching rules, or a required string, before a search can succeed.
+- A response that varies a lot between identical requests needs Burp's response analysis, looser rules or a required string before a search can succeed.
 
 ## Building
 
@@ -145,6 +153,7 @@ Requires Burp Suite 2023.12 or later.
 ## How it treats your data
 
 - Request and response content is treated as untrusted. Names and values taken from HTTP messages are always displayed as plain text, never interpreted as HTML.
+- JSON and XML bodies are read by small built-in parsers that only locate items and slice the original text. They never expand entities or fetch anything (no XXE), cannot be driven into deep recursion, and run in linear time.
 - Nothing is written to disk except your own settings, stored in Burp's extension preferences. Saved profiles keep one minimized request each, in Burp's temporary storage, for the current session.
 - All work that sends requests runs on a background thread, and stops when the extension is unloaded.
 

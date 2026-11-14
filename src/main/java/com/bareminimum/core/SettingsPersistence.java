@@ -19,6 +19,7 @@ public final class SettingsPersistence {
     private static final String PINNED_HEADERS = PREFIX + "pinnedHeaders";
     private static final String REQUEST_DELAY = PREFIX + "requestDelayMs";
     private static final String PARALLELISM = PREFIX + "parallelism";
+    private static final String RESPONSE_MATCHING = PREFIX + "responseMatching";
 
     private SettingsPersistence() {
     }
@@ -73,6 +74,14 @@ public final class SettingsPersistence {
             if (parallelism != null) {
                 config.setParallelism(parallelism);
             }
+            String matching = prefs.getString(RESPONSE_MATCHING);
+            if (matching != null) {
+                try {
+                    config.setResponseMatching(MinimizationConfig.ResponseMatching.valueOf(matching));
+                } catch (IllegalArgumentException ignored) {
+                    // keep the default
+                }
+            }
         } catch (RuntimeException ignored) {
             // Preferences are a convenience; fall back to defaults if they cannot be read.
         }
@@ -92,5 +101,6 @@ public final class SettingsPersistence {
         prefs.setString(PINNED_HEADERS, config.getPinnedHeadersCsv());
         prefs.setInteger(REQUEST_DELAY, config.getRequestDelayMs());
         prefs.setInteger(PARALLELISM, config.getParallelism());
+        prefs.setString(RESPONSE_MATCHING, config.getResponseMatching().name());
     }
 }

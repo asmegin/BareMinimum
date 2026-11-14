@@ -69,7 +69,7 @@ public final class ProfileStore {
                 case COOKIE -> reqCookies.add(item.name());
                 case HEADER -> reqHeaders.add(item.name());
                 case URL_PARAM -> reqUrlParams.add(item.name());
-                case BODY_PARAM, JSON_PARAM -> reqBodyParams.add(item.name());
+                case BODY_PARAM, JSON_PARAM, XML_PARAM -> reqBodyParams.add(item.name());
             }
         }
 

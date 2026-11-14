@@ -371,4 +371,172 @@ class DeltaDebugMinimizerTest {
         }
         assertEquals(recorder.steps.get(recorder.steps.size() - 1).stepNumber(), result.requestsSent());
     }
+
+    // --- Nested JSON and XML bodies ---------------------------------------------------------
+
+    /** Records every distinct body sent, to show that no request is wasted on an identical body. */
+    private static final class BodyCounter {
+        final List<String> bodies = new ArrayList<>();
+    }
+
+    @Test
+    void findsTheOneNestedJsonMemberThatMatters() {
+        HttpRequest request = FakeHttp.request("POST", "/api/order",
+                "{\"auth\": {\"token\": \"t0k\", \"client\": \"web\", \"ver\": 3},"
+                        + " \"data\": {\"a\": 1, \"b\": [1, 2, 3]}, \"trace\": {\"id\": \"x\", \"ts\": 5}, \"debug\": true}",
+                "Host: h", "Content-Type: application/json");
+        BodyCounter counter = new BodyCounter();
+
+        MinimizationResult result = run(request, MinimizationTarget.PARAMETERS, r -> {
+            counter.bodies.add(r.bodyToString());
+            return r.bodyToString().contains("\"token\": \"t0k\"") ? OK : DENIED;
+        }, null);
+
+        assertNull(result.errorMessage());
+        assertEquals(List.of("auth", "auth.token"), result.requiredItems().stream().map(RemovableItem::name).toList());
+        assertEquals("{\"auth\": {\"token\": \"t0k\"}}", result.minimizedRequest().bodyToString());
+        assertEquals(Set.of("auth", "auth.token"), result.profile().getRequiredBodyParams());
+
+        // Apart from the deliberate re-sends of the original and the final confirmation, the
+        // same body is never sent twice, even though removing a container removes its members.
+        long distinct = counter.bodies.stream().distinct().count();
+        assertTrue(counter.bodies.size() - distinct <= 2, counter.bodies.toString());
+        assertTrue(result.requestsSent() < 15, "requests: " + result.requestsSent());
+    }
+
+    @Test
+    void findsTheRequiredSoapElements() {
+        String body = "<?xml version=\"1.0\"?>\n"
+                + "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\n"
+                + "  <soap:Header><Trace id=\"7\">abc</Trace></soap:Header>\n"
+                + "  <soap:Body>\n"
+                + "    <m:GetUser xmlns:m=\"urn:x\" locale=\"en\">\n"
+                + "      <m:Id>5</m:Id>\n"
+                + "      <m:Verbose>true</m:Verbose>\n"
+                + "    </m:GetUser>\n"
+                + "  </soap:Body>\n"
+                + "</soap:Envelope>";
+        HttpRequest request = FakeHttp.request("POST", "/ws", body, "Host: h", "Content-Type: text/xml");
+
+        MinimizationResult result = run(request, MinimizationTarget.PARAMETERS, r -> {
+            String b = r.bodyToString();
+            return b.contains("<soap:Body>") && b.contains("<m:GetUser") && b.contains("<m:Id>5</m:Id>") ? OK : DENIED;
+        }, null);
+
+        assertNull(result.errorMessage());
+        assertEquals(List.of("soap:Envelope/soap:Body", "soap:Envelope/soap:Body/m:GetUser",
+                        "soap:Envelope/soap:Body/m:GetUser/m:Id"),
+                result.requiredItems().stream().map(RemovableItem::name).toList());
+        assertEquals("<?xml version=\"1.0\"?>\n"
+                + "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\n"
+                + "  <soap:Body>\n"
+                + "    <m:GetUser xmlns:m=\"urn:x\">\n"
+                + "      <m:Id>5</m:Id>\n"
+                + "    </m:GetUser>\n"
+                + "  </soap:Body>\n"
+                + "</soap:Envelope>", result.minimizedRequest().bodyToString());
+    }
+
+    @Test
+    void nestedSearchGivesTheSameAnswerAtEveryParallelism() {
+        StringBuilder body = new StringBuilder("{");
+        for (int i = 0; i < 12; i++) {
+            body.append(i == 0 ? "" : ", ").append("\"g").append(i).append("\": {\"x\": ").append(i * 100)
+                    .append(", \"y\": [").append(i * 1000 + 1).append(", ").append(i * 1000 + 2).append("]}");
+        }
+        HttpRequest request = FakeHttp.request("POST", "/", body.append('}').toString(), "Host: h");
+        // Needs g3.x and the first element of g9.y; everything else is junk.
+        Predicate<HttpRequest> accepts = r -> r.bodyToString().contains("\"x\": 300")
+                && r.bodyToString().contains("[9001");
+
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(8);
+        try {
+            for (int parallelism : new int[]{1, 2, 4, 8}) {
+                config.setParallelism(parallelism);
+                MinimizationResult result = minimizer.minimize(request, null, MinimizationTarget.PARAMETERS,
+                        r -> accepts.test(r) ? OK : DENIED, new AtomicBoolean(false), null, pool);
+                assertNull(result.errorMessage(), "parallelism " + parallelism);
+                assertEquals(List.of("g3", "g3.x", "g9", "g9.y", "g9.y[0]"),
+                        result.requiredItems().stream().map(RemovableItem::name).toList(), "parallelism " + parallelism);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    // --- Burp response analysis -------------------------------------------------------------
+
+    /** A page whose length changes on every request, as with a timestamp or a nonce. */
+    private static Function<HttpRequest, HttpResponse> noisyServer(Predicate<HttpRequest> loggedIn) {
+        AtomicInteger counter = new AtomicInteger();
+        return request -> {
+            String nonce = "n".repeat(1 + counter.incrementAndGet() % 7 * 40);
+            return loggedIn.test(request)
+                    ? FakeHttp.response(200, "<title>Account</title> Welcome back bob nonce=" + nonce)
+                    : FakeHttp.response(200, "<title>Sign in</title> Please sign in nonce=" + nonce);
+        };
+    }
+
+    @Test
+    void burpAnalysisHandlesPagesThatChangeOnEveryRequest() {
+        HttpRequest request = requestWithCookies(16, 5, 11);
+        Predicate<HttpRequest> loggedIn = r -> hasCookies(r, "session_id");
+
+        // The length rule cannot tell this page apart from itself.
+        MinimizationResult rules = run(request, MinimizationTarget.COOKIES, noisyServer(loggedIn), null);
+        assertNull(rules.profile());
+        assertTrue(rules.errorMessage().contains("not give a stable response"), rules.errorMessage());
+
+        config.setResponseMatching(MinimizationConfig.ResponseMatching.BURP_ANALYSIS);
+        Recorder recorder = new Recorder();
+        MinimizationResult analysis = run(request, MinimizationTarget.COOKIES, noisyServer(loggedIn), recorder);
+
+        assertNull(analysis.errorMessage());
+        assertEquals(Set.of("session_id"), analysis.profile().getRequiredCookies());
+        assertTrue(recorder.steps.get(0).description().contains("response sample 2 of 3"));
+        assertTrue(recorder.steps.get(1).description().contains("response attributes stay the same"),
+                recorder.steps.get(1).description());
+    }
+
+    @Test
+    void burpAnalysisSendsItsSamplesInTheFirstRound() {
+        config.setResponseMatching(MinimizationConfig.ResponseMatching.BURP_ANALYSIS);
+        AtomicInteger calls = new AtomicInteger();
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(4);
+        try {
+            MinimizationResult result = minimizer.minimize(requestWithCookies(4, 0, 0), null, MinimizationTarget.COOKIES,
+                    r -> {
+                        calls.incrementAndGet();
+                        return FakeHttp.response(200, "same");
+                    }, new AtomicBoolean(false), null, pool);
+            // 3 samples + "without any cookies", all in one round; nothing is required.
+            assertNull(result.errorMessage());
+            assertEquals(4, calls.get());
+            assertEquals(1, result.rounds());
+            assertTrue(result.requiredItems().isEmpty());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void burpAnalysisStopsWhenTheOriginalRequestChangesStatus() {
+        config.setResponseMatching(MinimizationConfig.ResponseMatching.BURP_ANALYSIS);
+        AtomicInteger calls = new AtomicInteger();
+        MinimizationResult result = run(requestWithCookies(4, 1, 2), MinimizationTarget.COOKIES,
+                r -> FakeHttp.response(calls.incrementAndGet() == 2 ? 500 : 200, "x"), null);
+
+        assertNull(result.profile());
+        assertTrue(result.errorMessage().contains("different status code"), result.errorMessage());
+    }
+
+    @Test
+    void burpAnalysisFailureTellsTheUserWhatToChange() {
+        config.setResponseMatching(MinimizationConfig.ResponseMatching.BURP_ANALYSIS);
+        MinimizationResult result = run(requestWithCookies(4, 1, 2), MinimizationTarget.COOKIES,
+                r -> FakeHttp.responseWithoutAnalysis(200, "x"), null);
+
+        assertNull(result.profile());
+        assertTrue(result.errorMessage().contains("'Rules'"), result.errorMessage());
+    }
 }

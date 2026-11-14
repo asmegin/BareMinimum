@@ -4,6 +4,7 @@ import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
 import com.bareminimum.core.RequestMutator.Prepared;
 import com.bareminimum.model.MinimizationConfig;
+import com.bareminimum.model.MinimizationConfig.ResponseMatching;
 import com.bareminimum.model.MinimizationProfile;
 import com.bareminimum.model.MinimizationTarget;
 import com.bareminimum.model.RemovableItem;
@@ -58,6 +59,9 @@ public final class DeltaDebugMinimizer {
 
     /** Consecutive unanswered requests after which a run gives up instead of hammering a dead target. */
     static final int MAX_CONSECUTIVE_FAILURES = 3;
+
+    /** Responses to the unmodified request that Burp's response analysis learns from. */
+    public static final int ANALYSIS_SAMPLES = 3;
 
     public record StepLog(
             int stepNumber,
@@ -178,7 +182,6 @@ public final class DeltaDebugMinimizer {
         final String description;
         final boolean bypassMemo;
         boolean passed;
-        boolean answered;
 
         Check(Set<RemovableItem> kept, String description, boolean bypassMemo) {
             this.kept = kept;
@@ -194,6 +197,7 @@ public final class DeltaDebugMinimizer {
         Boolean clean;     // null while untested
         Check check;       // set while scheduled in the current round
         boolean applied;   // removal already applied
+        boolean free;      // known clean without a request: everything in it was already gone
 
         Child(List<RemovableItem> items, String label) {
             this.items = items;
@@ -285,39 +289,15 @@ public final class DeltaDebugMinimizer {
                 return failure("Nothing to minimize: this request has no removable " + target.itemNoun() + ".");
             }
 
-            // 1. Baseline, stability check and the "nothing required" fast path, together if possible.
+            // 1. Baseline, stability check / response samples and the "nothing required" fast
+            //    path, together if possible.
             Set<RemovableItem> everything = new LinkedHashSet<>(all);
-            Check stability = cfg.isVerifyBaselineStability()
-                    ? new Check(everything, "Stability check: original request again", true)
-                    : null;
             Check empty = new Check(new LinkedHashSet<>(), "Without any candidate items", false);
-            List<Check> setupChecks = new ArrayList<>();
-            if (stability != null) {
-                setupChecks.add(stability);
-            }
-            setupChecks.add(empty);
-
-            MinimizationResult setupFailure = establishBaseline(existingBaseline, setupChecks);
+            MinimizationResult setupFailure = establishBaseline(existingBaseline, empty);
             if (setupFailure != null) {
                 return setupFailure;
             }
-
-            if (stability != null) {
-                if (!stability.passed) {
-                    if (shouldStop()) {
-                        return stopped();
-                    }
-                    if (!stability.answered) {
-                        return failure("No response received when re-sending the original request"
-                                + (lastSendError == null ? "." : " (" + lastSendError + ")."));
-                    }
-                    return failure("The original request does not give a stable response: sending it twice"
-                            + " produced responses that differ under the current matching rules."
-                            + " Adjust the baseline rules in the BareMinimum settings and try again.");
-                }
-            } else {
-                memo.put(everything, Boolean.TRUE);
-            }
+            memo.put(new HashSet<>(everything), Boolean.TRUE);
             if (shouldStop()) {
                 return stopped();
             }
@@ -331,7 +311,7 @@ public final class DeltaDebugMinimizer {
                 if (shouldStop()) {
                     return stopped();
                 }
-                required = all.stream().filter(item -> !removed.contains(item)).toList();
+                required = all.stream().filter(item -> !removed.contains(item) && !absent(item)).toList();
 
                 // 3. Confirm the result with a request sent now, at the end of the run. Earlier
                 //    answers are not enough: if the session expired part-way through, every later
@@ -365,76 +345,132 @@ public final class DeltaDebugMinimizer {
                     comparator.getBaselineStatusCode(), comparator.getBaselineBodyLength(), false, null);
         }
 
-        /**
-         * Gets the baseline response and runs {@code setupChecks}. Everything goes out in one round
-         * when the parallelism allows; otherwise one request at a time, stopping early when the
-         * stability check fails. Returns a result only if the run must end here.
-         */
-        private MinimizationResult establishBaseline(HttpResponse existingBaseline, List<Check> setupChecks) {
-            HttpResponse baseline = existingBaseline;
-            boolean needBaseline = baseline == null;
-            int batchSize = setupChecks.size() + (needBaseline ? 1 : 0);
+        /** A response to the unmodified request, with where it appears in the step log. */
+        private record Copy(Sent sent, int stepNumber, int round) {
+        }
 
-            if (parallelism >= batchSize && batchSize > 1) {
+        /**
+         * Gets the responses to the unmodified request that the matching rules need (the baseline,
+         * plus a stability copy or the samples Burp's response analysis learns from) and runs the
+         * {@code empty} check. Everything goes out in one round when the parallelism allows,
+         * otherwise one request at a time. Returns a result only if the run must end here.
+         */
+        private MinimizationResult establishBaseline(HttpResponse existingBaseline, Check empty) {
+            boolean analysis = cfg.getResponseMatching() == ResponseMatching.BURP_ANALYSIS;
+            int copiesWanted = analysis ? ANALYSIS_SAMPLES : (cfg.isVerifyBaselineStability() ? 2 : 1);
+            int toSend = copiesWanted - (existingBaseline != null ? 1 : 0);
+
+            List<Copy> copies = new ArrayList<>();
+            Sent emptySent = null;
+            if (toSend >= 1 && parallelism >= toSend + 1) {
                 List<HttpRequest> requests = new ArrayList<>();
-                if (needBaseline) {
+                for (int k = 0; k < toSend; k++) {
                     requests.add(original);
                 }
-                for (Check check : setupChecks) {
-                    requests.add(prepared.build(check.kept));
-                }
+                requests.add(prepared.build(empty.kept));
                 List<Sent> sent = sendBatch(requests);
                 beginRound();
-                int offset = 0;
-                if (needBaseline) {
-                    baseline = account(sent.get(0));
-                    offset = 1;
+                for (int k = 0; k < toSend; k++) {
+                    account(sent.get(k));
+                    copies.add(new Copy(sent.get(k), requestCount, rounds));
                 }
-                if (baseline == null) {
-                    for (int i = offset; i < sent.size(); i++) {
-                        account(sent.get(i));
+                emptySent = sent.get(toSend);
+            } else {
+                for (int k = 0; k < toSend; k++) {
+                    if (cancelled()) {
+                        return stopped();
                     }
-                    return noBaseline();
+                    Sent sent = sendBatch(List.of(original)).get(0);
+                    beginRound();
+                    account(sent);
+                    copies.add(new Copy(sent, requestCount, rounds));
+                    if (sent.response() == null) {
+                        break; // no point asking again
+                    }
                 }
-                setComparator(baseline);
-                for (int i = 0; i < setupChecks.size(); i++) {
-                    process(setupChecks.get(i), sent.get(offset + i));
-                }
-                return null;
             }
 
-            if (needBaseline) {
+            // The baseline: Burp's existing response, or the first copy sent.
+            HttpResponse baseline = existingBaseline;
+            List<Copy> extraCopies = copies;
+            if (baseline == null) {
+                baseline = copies.isEmpty() ? null : copies.get(0).sent().response();
+                extraCopies = copies.isEmpty() ? copies : copies.subList(1, copies.size());
+            }
+            if (baseline == null) {
+                if (emptySent != null) {
+                    account(emptySent);
+                }
                 if (cancelled()) {
                     return stopped();
                 }
-                List<Sent> sent = sendBatch(List.of(original));
-                beginRound();
-                baseline = account(sent.get(0));
-                if (baseline == null) {
-                    return noBaseline();
-                }
+                return failure("No response received for the original request"
+                        + (lastSendError == null ? "." : " (" + lastSendError + ")."));
             }
-            setComparator(baseline);
-            for (Check check : setupChecks) {
-                runChecks(List.of(check));
-                if (!check.passed && check.bypassMemo) {
-                    break; // the stability check failed: no point sending anything else
-                }
-            }
-            return null;
-        }
 
-        private MinimizationResult noBaseline() {
-            if (cancelled()) {
+            List<HttpResponse> samples = new ArrayList<>();
+            samples.add(baseline);
+            for (Copy copy : extraCopies) {
+                if (copy.sent().response() != null) {
+                    samples.add(copy.sent().response());
+                }
+            }
+            try {
+                comparator = new ResponseComparator(samples, cfg);
+            } catch (RuntimeException e) {
+                if (emptySent != null) {
+                    account(emptySent);
+                }
+                return failure("Burp could not analyse the responses (" + describe(e) + "). Set 'Response"
+                        + " matching' to 'Rules' in the BareMinimum settings and try again.");
+            }
+            listener.onBaselineEstablished(comparator.getBaselineStatusCode(), comparator.getBaselineBodyLength());
+
+            // Log the extra copies and check they agree with the baseline.
+            boolean noResponse = extraCopies.size() < copiesWanted - 1;
+            boolean unstable = false;
+            for (int k = 0; k < extraCopies.size(); k++) {
+                Copy copy = extraCopies.get(k);
+                HttpResponse response = copy.sent().response();
+                boolean ok = response != null && comparator.acceptsSample(response);
+                noResponse |= response == null;
+                unstable |= !ok;
+                String description = analysis
+                        ? "Original request again (response sample " + (k + 2) + " of " + copiesWanted + ")"
+                        : "Stability check: original request again";
+                if (analysis && k == extraCopies.size() - 1) {
+                    description += ": " + comparator.stableAttributeCount() + " response attributes stay the same";
+                }
+                listener.onStep(new StepLog(copy.stepNumber(), copy.round(),
+                        response == null ? description + " (no response)" : description,
+                        all.size(), all.size(),
+                        response == null ? 0 : response.statusCode(),
+                        ResponseComparator.bodyLength(response), ok));
+            }
+
+            if (emptySent != null) {
+                process(empty, emptySent);
+            }
+            if (shouldStop()) {
                 return stopped();
             }
-            return failure("No response received for the original request"
-                    + (lastSendError == null ? "." : " (" + lastSendError + ")."));
-        }
-
-        private void setComparator(HttpResponse baseline) {
-            comparator = new ResponseComparator(baseline, cfg);
-            listener.onBaselineEstablished(comparator.getBaselineStatusCode(), comparator.getBaselineBodyLength());
+            if (noResponse) {
+                return failure("No response received when re-sending the original request"
+                        + (lastSendError == null ? "." : " (" + lastSendError + ")."));
+            }
+            if (unstable) {
+                return failure(analysis
+                        ? "The original request does not give a stable response: sending it again produced a"
+                        + " different status code, or broke the required/forbidden substring rules."
+                        : "The original request does not give a stable response: sending it twice"
+                        + " produced responses that differ under the current matching rules."
+                        + " Adjust the baseline rules in the BareMinimum settings, or switch 'Response"
+                        + " matching' to Burp's response analysis, and try again.");
+            }
+            if (emptySent == null) {
+                runChecks(List.of(empty));
+            }
+            return null;
         }
 
         // --- Search --------------------------------------------------------------------------
@@ -458,6 +494,7 @@ public final class DeltaDebugMinimizer {
             int maxRounds = 4 * all.size() + 32;
             int searchRounds = 0;
             while (!shouldStop()) {
+                pruneAbsent();
                 while (!dirty.isEmpty()) {
                     List<RemovableItem> group = dirty.poll();
                     if (group.size() == 1) {
@@ -593,14 +630,93 @@ public final class DeltaDebugMinimizer {
                 return true;
             }
             if (untested.isEmpty()) {
-                // Each part can go on its own, but not all of them at once (e.g. either of two
-                // cookies works). Keep the last part and narrow it down with the others removed.
-                Child last = set.children.get(set.children.size() - 1);
-                removed.removeAll(last.items);
-                dirty.add(last.items);
+                // Every part tested clean. If removing one of them already took the others with it
+                // (they sit inside it in a JSON/XML body), that request covered them all.
+                for (Child child : set.children) {
+                    if (!child.free && coversSiblings(child, set)) {
+                        return true;
+                    }
+                }
+                // Otherwise each part can go on its own, but not all of them at once (e.g. either
+                // of two cookies works). Keep the last part and narrow it down without the others.
+                Child last = null;
+                for (Child child : set.children) {
+                    if (!child.free) {
+                        last = child;
+                    }
+                }
+                if (last != null) {
+                    removed.removeAll(last.items);
+                    dirty.add(last.items);
+                }
                 return true;
             }
             return false;
+        }
+
+        /** True if every item of the other parts of {@code set} sits inside {@code child}. */
+        private boolean coversSiblings(Child child, SiblingSet set) {
+            if (!prepared.hasNestedItems()) {
+                return false;
+            }
+            Set<RemovableItem> mine = new HashSet<>(child.items);
+            for (Child other : set.children) {
+                if (other == child) {
+                    continue;
+                }
+                for (RemovableItem item : other.items) {
+                    if (!mine.contains(item) && !prepared.anyAncestorIn(item, mine)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        /** True if {@code item} sits inside a removed JSON container or XML element. */
+        private boolean absent(RemovableItem item) {
+            return prepared.hasNestedItems() && prepared.anyAncestorIn(item, removed);
+        }
+
+        /**
+         * Items inside a removed JSON container or XML element are already missing from every
+         * request, so they are dropped without spending a request on them.
+         */
+        private void pruneAbsent() {
+            if (!prepared.hasNestedItems()) {
+                return;
+            }
+            pool.removeIf(item -> {
+                if (absent(item)) {
+                    removed.add(item);
+                    return true;
+                }
+                return false;
+            });
+            for (SiblingSet set : new ArrayList<>(siblingSets)) {
+                boolean changed = false;
+                for (Child child : set.children) {
+                    if (child.clean == null && child.check == null && child.items.stream().allMatch(this::absent)) {
+                        child.clean = true;
+                        child.free = true;
+                        changed = true;
+                    }
+                }
+                if (changed && resolve(set)) {
+                    siblingSets.remove(set);
+                }
+            }
+            int groups = dirty.size();
+            for (int g = 0; g < groups; g++) {
+                List<RemovableItem> group = dirty.poll();
+                List<RemovableItem> present = group.stream().filter(item -> !absent(item)).toList();
+                if (present.size() < group.size()) {
+                    group.stream().filter(this::absent).forEach(removed::add);
+                }
+                if (!present.isEmpty()) {
+                    dirty.add(present);
+                }
+            }
         }
 
         /**
@@ -696,6 +812,10 @@ public final class DeltaDebugMinimizer {
                 }
                 List<RemovableItem> trial = new ArrayList<>(current);
                 trial.remove(item);
+                if (prepared.hasNestedItems() && !prepared.allAncestorsIn(item, new HashSet<>(current))) {
+                    current = trial; // already gone with the container it sits in
+                    continue;
+                }
                 Check check = new Check(new LinkedHashSet<>(trial), "Fallback: without one more item", true);
                 runChecks(List.of(check));
                 if (check.passed) {
@@ -715,7 +835,7 @@ public final class DeltaDebugMinimizer {
             if (shouldStop()) {
                 return false;
             }
-            if (passedInLastRound.contains(kept)) {
+            if (passedInLastRound.contains(prepared.effective(kept))) {
                 return true;
             }
             Check check = new Check(kept, description, true);
@@ -730,10 +850,9 @@ public final class DeltaDebugMinimizer {
             }
             List<Check> toSend = new ArrayList<>();
             for (Check check : checks) {
-                Boolean cached = check.bypassMemo ? null : memo.get(check.kept);
+                Boolean cached = check.bypassMemo ? null : memo.get(prepared.effective(check.kept));
                 if (cached != null) {
                     check.passed = cached;
-                    check.answered = true;
                 } else {
                     toSend.add(check);
                 }
@@ -764,7 +883,6 @@ public final class DeltaDebugMinimizer {
                 check.passed = false; // never sent because the run is stopping
                 return;
             }
-            check.answered = response != null;
             if (response == null) {
                 if (!cancelled() && ++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES && abortReason == null) {
                     abortReason = "Stopped: the target did not respond to " + MAX_CONSECUTIVE_FAILURES
@@ -776,7 +894,7 @@ public final class DeltaDebugMinimizer {
 
             boolean passed = response != null && comparator.isEquivalent(response);
             check.passed = passed;
-            Set<RemovableItem> key = new HashSet<>(check.kept);
+            Set<RemovableItem> key = new HashSet<>(prepared.effective(check.kept));
             memo.put(key, passed);
             if (passed) {
                 passedInLastRound.add(key);

@@ -2,7 +2,6 @@ package com.bareminimum.core;
 
 import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.requests.HttpRequest;
-import com.bareminimum.core.JsonBodyHelper.JsonField;
 import com.bareminimum.core.RequestParts.Multipart;
 import com.bareminimum.core.RequestParts.Segment;
 import com.bareminimum.model.MinimizationConfig;
@@ -12,7 +11,10 @@ import com.bareminimum.model.RemovableItem;
 import com.bareminimum.model.RemovableItem.Category;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,6 +22,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.IntFunction;
+import java.util.function.IntUnaryOperator;
 
 /**
  * Extracts candidate {@link RemovableItem}s from an {@link HttpRequest} and builds mutated
@@ -45,8 +49,34 @@ public final class RequestMutator {
         boolean keep(Category category, int index, String name);
     }
 
-    private record ParsedBody(Category category, List<Segment> segments, Function<List<Segment>, String> rebuilder) {
-        static final ParsedBody NONE = new ParsedBody(Category.BODY_PARAM, List.of(), kept -> "");
+    /**
+     * Most JSON/XML members a single request offers for removal, and how deep they may be nested.
+     * Anything beyond is simply kept as it is, so a huge document cannot turn into thousands of
+     * test requests.
+     */
+    static final int MAX_STRUCTURED_ITEMS = 1000;
+    static final int MAX_STRUCTURED_DEPTH = 32;
+
+    /**
+     * The removable items of a body. {@code parents[i]} is the index of the item that contains
+     * item {@code i} (a JSON container or XML element), or -1; removing a parent also removes
+     * everything inside it. {@code rebuilder} writes the body keeping exactly the set items.
+     */
+    private record ParsedBody(Category category, List<Segment> segments, int[] parents,
+                              Function<BitSet, String> rebuilder) {
+        static final ParsedBody NONE = new ParsedBody(Category.BODY_PARAM, List.of(), new int[0], kept -> "");
+
+        static ParsedBody flat(Category category, List<Segment> segments, Function<List<Segment>, String> rebuilder) {
+            int[] parents = new int[segments.size()];
+            Arrays.fill(parents, -1);
+            return new ParsedBody(category, List.copyOf(segments), parents, kept -> {
+                List<Segment> keptSegments = new ArrayList<>(kept.cardinality());
+                for (int i = kept.nextSetBit(0); i >= 0; i = kept.nextSetBit(i + 1)) {
+                    keptSegments.add(segments.get(i));
+                }
+                return rebuilder.apply(keptSegments);
+            });
+        }
     }
 
     private RequestMutator() {
@@ -105,7 +135,7 @@ public final class RequestMutator {
             case COOKIE -> profile.getRequiredCookies().contains(name);
             case HEADER -> profile.isHeaderRequired(name);
             case URL_PARAM -> profile.getRequiredUrlParams().contains(name);
-            case BODY_PARAM, JSON_PARAM -> profile.getRequiredBodyParams().contains(name);
+            case BODY_PARAM, JSON_PARAM, XML_PARAM -> profile.getRequiredBodyParams().contains(name);
         });
     }
 
@@ -130,6 +160,7 @@ public final class RequestMutator {
         private final List<Segment> query;
         private final ParsedBody body;
         private final List<RemovableItem> candidates;
+        private final Map<RemovableItem, RemovableItem> parents;
 
         private Prepared(HttpRequest original, MinimizationTarget target, MinimizationConfig config) {
             this.original = original;
@@ -165,8 +196,69 @@ public final class RequestMutator {
                 items.add(new RemovableItem(Category.HEADER, header.name(), clip(header.value()), i));
             }
             addItems(items, Category.URL_PARAM, query);
+            int bodyOffset = items.size();
             addItems(items, body.category(), body.segments());
             this.candidates = Collections.unmodifiableList(items);
+
+            Map<RemovableItem, RemovableItem> parentMap = new HashMap<>();
+            for (int i = 0; i < body.parents().length; i++) {
+                int parent = body.parents()[i];
+                if (parent >= 0) {
+                    parentMap.put(items.get(bodyOffset + i), items.get(bodyOffset + parent));
+                }
+            }
+            this.parents = Collections.unmodifiableMap(parentMap);
+        }
+
+        /**
+         * The item that contains {@code item} (a JSON container or XML element), or null. When
+         * the parent is removed, {@code item} is gone from the request whether it is kept or not.
+         */
+        public RemovableItem parentOf(RemovableItem item) {
+            return parents.get(item);
+        }
+
+        /** True if some items are nested inside others (a nested JSON or XML body). */
+        public boolean hasNestedItems() {
+            return !parents.isEmpty();
+        }
+
+        /**
+         * The items of {@code kept} that actually appear in the request built from it: those
+         * whose enclosing items are all kept too. Two sets with the same effective items build
+         * the same request.
+         */
+        public Set<RemovableItem> effective(Set<RemovableItem> kept) {
+            if (parents.isEmpty()) {
+                return kept;
+            }
+            Set<RemovableItem> result = new HashSet<>();
+            for (RemovableItem item : kept) {
+                if (allAncestorsIn(item, kept)) {
+                    result.add(item);
+                }
+            }
+            return result;
+        }
+
+        /** True if every item enclosing {@code item} is in {@code set}. */
+        public boolean allAncestorsIn(RemovableItem item, Set<RemovableItem> set) {
+            for (RemovableItem p = parents.get(item); p != null; p = parents.get(p)) {
+                if (!set.contains(p)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /** True if some item enclosing {@code item} is in {@code set}. */
+        public boolean anyAncestorIn(RemovableItem item, Set<RemovableItem> set) {
+            for (RemovableItem p = parents.get(item); p != null; p = parents.get(p)) {
+                if (set.contains(p)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         public HttpRequest original() {
@@ -279,11 +371,17 @@ public final class RequestMutator {
         }
 
         private HttpRequest filterBody(HttpRequest mutated, ItemFilter filter) {
-            if (body.segments().isEmpty()) {
+            List<Segment> segments = body.segments();
+            if (segments.isEmpty()) {
                 return mutated;
             }
-            List<Segment> kept = keep(body.segments(), body.category(), filter);
-            if (kept.size() == body.segments().size()) {
+            BitSet kept = new BitSet(segments.size());
+            for (int i = 0; i < segments.size(); i++) {
+                if (filter.keep(body.category(), i, segments.get(i).name())) {
+                    kept.set(i);
+                }
+            }
+            if (kept.cardinality() == segments.size()) {
                 return mutated;
             }
             // withBody() also updates Content-Length to match the new body.
@@ -315,23 +413,12 @@ public final class RequestMutator {
         }
 
         // JSON is recognised by content rather than by Content-Type, which is often wrong.
-        List<JsonField> jsonFields = JsonBodyHelper.parseTopLevelObject(body);
-        if (!jsonFields.isEmpty()) {
-            List<Segment> segments = new ArrayList<>(jsonFields.size());
-            for (JsonField field : jsonFields) {
-                // The segment's raw text is the member exactly as it is written back out.
-                segments.add(new Segment(field.name(), field.rawValue(), JsonBodyHelper.renderField(field)));
-            }
-            return new ParsedBody(Category.JSON_PARAM, List.copyOf(segments), kept -> {
-                StringBuilder sb = new StringBuilder("{");
-                for (int i = 0; i < kept.size(); i++) {
-                    if (i > 0) {
-                        sb.append(", ");
-                    }
-                    sb.append(kept.get(i).raw());
-                }
-                return sb.append('}').toString();
-            });
+        JsonBodyHelper.Tree json = JsonBodyHelper.parseTree(body);
+        if (json != null) {
+            List<JsonBodyHelper.Node> nodes = json.nodes();
+            return structured(Category.JSON_PARAM, nodes.size(),
+                    k -> nodes.get(k).path, k -> clip(body, nodes.get(k).valueStart, nodes.get(k).valueEnd()),
+                    k -> nodes.get(k).parent, k -> nodes.get(k).depth, json::render);
         }
 
         String contentType = headerValue(headers, CONTENT_TYPE);
@@ -341,16 +428,71 @@ public final class RequestMutator {
             Multipart multipart = RequestParts.parseMultipart(body, RequestParts.multipartBoundary(contentType));
             return multipart == null
                     ? ParsedBody.NONE
-                    : new ParsedBody(Category.BODY_PARAM, List.copyOf(multipart.parts()), multipart::rebuild);
+                    : ParsedBody.flat(Category.BODY_PARAM, multipart.parts(), multipart::rebuild);
         }
 
-        boolean urlEncoded = lowerContentType != null
-                ? lowerContentType.contains("application/x-www-form-urlencoded")
-                : RequestParts.looksUrlEncoded(body);
+        boolean declaredForm = lowerContentType != null && lowerContentType.contains("application/x-www-form-urlencoded");
+        if (!declaredForm && (lowerContentType != null && lowerContentType.contains("xml") || looksLikeXml(body))) {
+            XmlBodyHelper.Tree xml = XmlBodyHelper.parse(body);
+            if (xml != null) {
+                List<XmlBodyHelper.Node> nodes = xml.nodes();
+                return structured(Category.XML_PARAM, nodes.size(),
+                        k -> nodes.get(k).path, k -> clip(body, nodes.get(k).valueStart(), nodes.get(k).valueEnd()),
+                        k -> nodes.get(k).parent, k -> nodes.get(k).depth, xml::render);
+            }
+        }
+
+        boolean urlEncoded = lowerContentType != null ? declaredForm : RequestParts.looksUrlEncoded(body);
         if (urlEncoded) {
-            return new ParsedBody(Category.BODY_PARAM, List.copyOf(RequestParts.splitPairs(body)), RequestParts::joinPairs);
+            return ParsedBody.flat(Category.BODY_PARAM, RequestParts.splitPairs(body), RequestParts::joinPairs);
         }
         return ParsedBody.NONE;
+    }
+
+    private static boolean looksLikeXml(String body) {
+        for (int i = 0; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '﻿') {
+                return c == '<';
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Turns the nodes of a JSON or XML tree into removable items. Nodes deeper than
+     * {@link #MAX_STRUCTURED_DEPTH}, or beyond the first {@link #MAX_STRUCTURED_ITEMS} in document
+     * order, are not offered for removal and always stay. An offered node's enclosing nodes are
+     * always offered too (they are shallower and come earlier), so parents map onto items.
+     */
+    private static ParsedBody structured(Category category, int nodeCount,
+                                         IntFunction<String> name, IntFunction<String> value,
+                                         IntUnaryOperator parent, IntUnaryOperator depth,
+                                         Function<boolean[], String> renderer) {
+        int[] itemOfNode = new int[nodeCount];
+        int[] nodeOfItem = new int[Math.min(nodeCount, MAX_STRUCTURED_ITEMS)];
+        List<Segment> segments = new ArrayList<>();
+        List<Integer> parents = new ArrayList<>();
+        for (int k = 0; k < nodeCount; k++) {
+            itemOfNode[k] = -1;
+            if (segments.size() >= MAX_STRUCTURED_ITEMS || depth.applyAsInt(k) > MAX_STRUCTURED_DEPTH) {
+                continue;
+            }
+            int parentNode = parent.applyAsInt(k);
+            nodeOfItem[segments.size()] = k;
+            itemOfNode[k] = segments.size();
+            parents.add(parentNode < 0 ? -1 : itemOfNode[parentNode]);
+            segments.add(new Segment(name.apply(k), value.apply(k), null));
+        }
+        int itemCount = segments.size();
+        int[] parentArray = parents.stream().mapToInt(Integer::intValue).toArray();
+        return new ParsedBody(category, List.copyOf(segments), parentArray, kept -> {
+            boolean[] removed = new boolean[nodeCount];
+            for (int i = 0; i < itemCount; i++) {
+                removed[nodeOfItem[i]] = !kept.get(i);
+            }
+            return renderer.apply(removed);
+        });
     }
 
     private static String headerValue(List<HttpHeader> headers, String name) {
@@ -403,6 +545,14 @@ public final class RequestMutator {
             Segment segment = segments.get(i);
             items.add(new RemovableItem(category, segment.name(), clip(segment.value()), i));
         }
+    }
+
+    /** Display value for {@code text[start, end)}, clipped without copying the whole range. */
+    private static String clip(String text, int start, int end) {
+        int length = end - start;
+        return length <= MAX_DISPLAY_VALUE_LENGTH
+                ? text.substring(start, end)
+                : text.substring(start, start + MAX_DISPLAY_VALUE_LENGTH) + "… (" + length + " chars)";
     }
 
     private static String clip(String value) {

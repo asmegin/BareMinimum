@@ -4,11 +4,14 @@ import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
+import burp.api.montoya.http.message.responses.analysis.Attribute;
+import burp.api.montoya.http.message.responses.analysis.AttributeType;
 
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Minimal in-memory stand-ins for the Montoya HTTP message interfaces, which normally only exist
@@ -131,7 +134,24 @@ public final class FakeHttp {
         return sb.append("\r\n").append(body).toString();
     }
 
+    private static final AtomicInteger LAST_MODIFIED = new AtomicInteger();
+
+    /**
+     * A response that also supports {@code attributes(...)}, with a few of Burp's response
+     * attributes worked out from the status and body: status code, content length, body content,
+     * word count and page title. Last-Modified differs on every call, as it does on many servers.
+     */
     public static HttpResponse response(int statusCode, String body) {
+        return response(statusCode, body, true);
+    }
+
+    /** A response on which Burp's response analysis fails. */
+    public static HttpResponse responseWithoutAnalysis(int statusCode, String body) {
+        return response(statusCode, body, false);
+    }
+
+    private static HttpResponse response(int statusCode, String body, boolean analysable) {
+        int lastModified = LAST_MODIFIED.incrementAndGet();
         return (HttpResponse) Proxy.newProxyInstance(
                 HttpResponse.class.getClassLoader(),
                 new Class<?>[]{HttpResponse.class},
@@ -139,11 +159,51 @@ public final class FakeHttp {
                     case "statusCode" -> (short) statusCode;
                     case "bodyToString" -> body;
                     case "body" -> bytes(body);
+                    case "attributes" -> {
+                        if (!analysable) {
+                            throw new UnsupportedOperationException("response analysis");
+                        }
+                        yield attributes((AttributeType[]) args[0], statusCode, body, lastModified);
+                    }
                     case "toString" -> statusCode + " " + body;
                     case "equals" -> proxy == args[0];
                     case "hashCode" -> System.identityHashCode(proxy);
                     default -> throw new UnsupportedOperationException("FakeHttp response: " + m.getName());
                 });
+    }
+
+    private static List<Attribute> attributes(AttributeType[] types, int statusCode, String body, int lastModified) {
+        List<Attribute> result = new ArrayList<>();
+        for (AttributeType type : types) {
+            Integer value = switch (type) {
+                case STATUS_CODE -> statusCode;
+                case CONTENT_LENGTH -> body.length();
+                case BODY_CONTENT -> body.hashCode();
+                case WORD_COUNT -> body.isBlank() ? 0 : body.trim().split("\\s+").length;
+                case PAGE_TITLE -> {
+                    int start = body.indexOf("<title>");
+                    int end = body.indexOf("</title>");
+                    yield start >= 0 && end > start ? body.substring(start + 7, end).hashCode() : 0;
+                }
+                case LAST_MODIFIED_HEADER -> lastModified;
+                default -> null;
+            };
+            if (value != null) {
+                int v = value;
+                result.add(new Attribute() {
+                    @Override
+                    public AttributeType type() {
+                        return type;
+                    }
+
+                    @Override
+                    public int value() {
+                        return v;
+                    }
+                });
+            }
+        }
+        return result;
     }
 
     private static ByteArray bytes(String text) {

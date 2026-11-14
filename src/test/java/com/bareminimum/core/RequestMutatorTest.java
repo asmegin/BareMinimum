@@ -18,6 +18,8 @@ import java.util.Set;
 import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -165,8 +167,8 @@ class RequestMutatorTest {
         HttpRequest text = FakeHttp.request("POST", "/", "some text = not a form", "Host: h");
         assertTrue(RequestMutator.extractCandidates(text, MinimizationTarget.PARAMETERS, config).isEmpty());
 
-        HttpRequest xml = FakeHttp.request("POST", "/", "<a b=\"1\"/>", "Host: h", "Content-Type: text/xml");
-        assertTrue(RequestMutator.extractCandidates(xml, MinimizationTarget.PARAMETERS, config).isEmpty());
+        HttpRequest brokenXml = FakeHttp.request("POST", "/", "<a><b></a>", "Host: h", "Content-Type: text/xml");
+        assertTrue(RequestMutator.extractCandidates(brokenXml, MinimizationTarget.PARAMETERS, config).isEmpty());
     }
 
     @Test
@@ -178,12 +180,144 @@ class RequestMutatorTest {
         assertEquals(List.of(
                 new RemovableItem(Category.JSON_PARAM, "id", "5", 0),
                 new RemovableItem(Category.JSON_PARAM, "meta", "{\"a\": [1, 2]}", 1),
-                new RemovableItem(Category.JSON_PARAM, "debug", "false", 2)
+                new RemovableItem(Category.JSON_PARAM, "meta.a", "[1, 2]", 2),
+                new RemovableItem(Category.JSON_PARAM, "meta.a[0]", "1", 3),
+                new RemovableItem(Category.JSON_PARAM, "meta.a[1]", "2", 4),
+                new RemovableItem(Category.JSON_PARAM, "debug", "false", 5)
         ), items);
 
         HttpRequest mutated = subset(request, MinimizationTarget.PARAMETERS, item -> !item.name().equals("debug"));
         assertEquals("{\"id\": 5, \"meta\": {\"a\": [1, 2]}}", mutated.bodyToString());
         assertEquals("{}", subset(request, MinimizationTarget.PARAMETERS, item -> false).bodyToString());
+    }
+
+    @Test
+    void nestedJsonMembersAreRemovedAndUntouchedContainersStayVerbatim() {
+        String body = "{\n  \"user\": {\"name\": \"bob\", \"role\": \"admin\"},\n"
+                + "  \"items\": [{\"id\": 1, \"qty\": 2}, {\"id\": 2}],\n"
+                + "  \"meta\": {\n    \"trace\": \"x\"\n  }\n}";
+        HttpRequest request = FakeHttp.request("POST", "/api", body, "Host: h", "Content-Type: application/json");
+
+        List<RemovableItem> items = RequestMutator.extractCandidates(request, MinimizationTarget.PARAMETERS, config);
+        assertEquals(List.of("user", "user.name", "user.role", "items", "items[0]", "items[0].id", "items[0].qty",
+                "items[1]", "items[1].id", "meta", "meta.trace"), items.stream().map(RemovableItem::name).toList());
+
+        HttpRequest noRole = subset(request, MinimizationTarget.PARAMETERS, item -> !item.name().equals("user.role"));
+        assertEquals("{\"user\": {\"name\": \"bob\"}, \"items\": [{\"id\": 1, \"qty\": 2}, {\"id\": 2}],"
+                + " \"meta\": {\n    \"trace\": \"x\"\n  }}", noRole.bodyToString());
+
+        HttpRequest secondItemGone = subset(request, MinimizationTarget.PARAMETERS,
+                item -> !item.name().startsWith("items[1]") && !item.name().startsWith("meta"));
+        assertEquals("{\"user\": {\"name\": \"bob\", \"role\": \"admin\"}, \"items\": [{\"id\": 1, \"qty\": 2}]}",
+                secondItemGone.bodyToString());
+
+        // Removing a container removes what is inside it, whether those items are kept or not.
+        HttpRequest noUser = subset(request, MinimizationTarget.PARAMETERS, item -> !item.name().equals("user"));
+        assertTrue(noUser.bodyToString().startsWith("{\"items\": "));
+        assertFalse(noUser.bodyToString().contains("bob"));
+    }
+
+    @Test
+    void nestedItemsKnowTheirParentsAndWhatActuallyRemains() {
+        HttpRequest request = FakeHttp.request("POST", "/api", "[{\"a\": 1}, {\"b\": {\"c\": 2}}]", "Host: h");
+        RequestMutator.Prepared prepared = RequestMutator.prepare(request, MinimizationTarget.PARAMETERS, config);
+        List<RemovableItem> items = prepared.candidates();
+        assertEquals(List.of("[0]", "[0].a", "[1]", "[1].b", "[1].b.c"), items.stream().map(RemovableItem::name).toList());
+        assertTrue(prepared.hasNestedItems());
+        assertEquals(items.get(3), prepared.parentOf(items.get(4)));
+        assertNull(prepared.parentOf(items.get(0)));
+
+        // Without [1], [1].b and [1].b.c are not in the request even though they are "kept".
+        Set<RemovableItem> kept = new LinkedHashSet<>(items);
+        kept.remove(items.get(2));
+        assertEquals(Set.of(items.get(0), items.get(1)), prepared.effective(kept));
+        assertEquals("[{\"a\": 1}]", prepared.build(kept).bodyToString());
+    }
+
+    @Test
+    void hugeJsonDocumentsOnlyOfferTheFirstItems() {
+        StringBuilder body = new StringBuilder("[");
+        for (int i = 0; i < 1500; i++) {
+            body.append(i == 0 ? "" : ",").append(i);
+        }
+        HttpRequest request = FakeHttp.request("POST", "/", body.append(']').toString(), "Host: h");
+
+        List<RemovableItem> items = RequestMutator.extractCandidates(request, MinimizationTarget.PARAMETERS, config);
+        assertEquals(RequestMutator.MAX_STRUCTURED_ITEMS, items.size());
+        assertTrue(subset(request, MinimizationTarget.PARAMETERS, item -> false).bodyToString().startsWith("[1000, 1001, "));
+
+        String deep = "{\"k\": ".repeat(40) + "1" + "}".repeat(40);
+        HttpRequest deepRequest = FakeHttp.request("POST", "/", deep, "Host: h");
+        assertEquals(RequestMutator.MAX_STRUCTURED_DEPTH,
+                RequestMutator.extractCandidates(deepRequest, MinimizationTarget.PARAMETERS, config).size());
+    }
+
+    @Test
+    void xmlElementsAndAttributesAreRemovedFromTheOriginalText() {
+        String body = "<?xml version=\"1.0\"?>\n"
+                + "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\n"
+                + "  <soap:Header>\n"
+                + "    <Trace id=\"7\">abc</Trace>\n"
+                + "  </soap:Header>\n"
+                + "  <soap:Body>\n"
+                + "    <m:GetUser xmlns:m=\"urn:x\">\n"
+                + "      <m:Id>5</m:Id>\n"
+                + "      <m:Verbose>true</m:Verbose>\n"
+                + "    </m:GetUser>\n"
+                + "  </soap:Body>\n"
+                + "</soap:Envelope>\n";
+        HttpRequest request = FakeHttp.request("POST", "/ws", body, "Host: h", "Content-Type: text/xml; charset=utf-8");
+
+        List<RemovableItem> items = RequestMutator.extractCandidates(request, MinimizationTarget.PARAMETERS, config);
+        assertEquals(List.of(
+                "soap:Envelope/soap:Header",
+                "soap:Envelope/soap:Header/Trace",
+                "soap:Envelope/soap:Header/Trace/@id",
+                "soap:Envelope/soap:Body",
+                "soap:Envelope/soap:Body/m:GetUser",
+                "soap:Envelope/soap:Body/m:GetUser/m:Id",
+                "soap:Envelope/soap:Body/m:GetUser/m:Verbose"), items.stream().map(RemovableItem::name).toList());
+        assertTrue(items.stream().allMatch(item -> item.category() == Category.XML_PARAM));
+        assertEquals("5", items.get(5).value());
+        assertEquals("7", items.get(2).value());
+
+        HttpRequest mutated = subset(request, MinimizationTarget.PARAMETERS,
+                item -> !item.name().endsWith("soap:Header") && !item.name().endsWith("m:Verbose"));
+        assertEquals("<?xml version=\"1.0\"?>\n"
+                + "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\n"
+                + "  <soap:Body>\n"
+                + "    <m:GetUser xmlns:m=\"urn:x\">\n"
+                + "      <m:Id>5</m:Id>\n"
+                + "    </m:GetUser>\n"
+                + "  </soap:Body>\n"
+                + "</soap:Envelope>\n", mutated.bodyToString());
+    }
+
+    @Test
+    void xmlIsRecognisedWithoutContentTypeButNotInAFormBody() {
+        HttpRequest noType = FakeHttp.request("POST", "/", "<order id=\"1\" currency='EUR'><item sku=\"a\"/></order>",
+                "Host: h");
+        assertEquals(List.of("order/@id", "order/@currency", "order/item", "order/item/@sku"),
+                RequestMutator.extractCandidates(noType, MinimizationTarget.PARAMETERS, config)
+                        .stream().map(RemovableItem::name).toList());
+        assertEquals("<order id=\"1\"><item sku=\"a\"/></order>",
+                subset(noType, MinimizationTarget.PARAMETERS, item -> !item.name().endsWith("@currency")).bodyToString());
+
+        HttpRequest form = FakeHttp.request("POST", "/", "<a/>", "Host: h",
+                "Content-Type: application/x-www-form-urlencoded");
+        assertTrue(RequestMutator.extractCandidates(form, MinimizationTarget.PARAMETERS, config)
+                .stream().noneMatch(item -> item.category() == Category.XML_PARAM));
+    }
+
+    @Test
+    void applyProfileKeepsNestedItemsByPath() {
+        MinimizationProfile profile = new MinimizationProfile(
+                "POST - PARAMETERS 1", "POST", "/api", MinimizationTarget.PARAMETERS,
+                Set.of(), Set.of(), Set.of(), Set.of("auth", "auth.token"), 5, 2, 9, null, null);
+        HttpRequest request = FakeHttp.request("POST", "/api",
+                "{\"auth\": {\"token\": \"NEW\", \"client\": \"web\"}, \"debug\": true}", "Host: h");
+
+        assertEquals("{\"auth\": {\"token\": \"NEW\"}}", RequestMutator.applyProfile(request, profile, config).bodyToString());
     }
 
     @Test

@@ -5,8 +5,11 @@ import com.bareminimum.FakeHttp;
 import com.bareminimum.model.MinimizationConfig;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ResponseComparatorTest {
@@ -80,6 +83,61 @@ class ResponseComparatorTest {
         assertTrue(comparator.isEquivalent(FakeHttp.response(200, "Welcome, bob")));
         assertFalse(comparator.isEquivalent(FakeHttp.response(200, "Hello, bob")));
         assertFalse(comparator.isEquivalent(FakeHttp.response(200, "Welcome. Sign in to continue")));
+    }
+
+    // --- Burp response analysis -------------------------------------------------------------
+
+    private static MinimizationConfig analysis() {
+        MinimizationConfig config = new MinimizationConfig();
+        config.setResponseMatching(MinimizationConfig.ResponseMatching.BURP_ANALYSIS);
+        return config;
+    }
+
+    @Test
+    void analysisLearnsWhatVariesAndIgnoresIt() {
+        // The id changes length and content every time; the title and word count do not.
+        ResponseComparator comparator = new ResponseComparator(List.of(
+                FakeHttp.response(200, "<title>Account</title> Hello bob id=a"),
+                FakeHttp.response(200, "<title>Account</title> Hello bob id=bbbbbbb"),
+                FakeHttp.response(200, "<title>Account</title> Hello bob id=cc")), analysis());
+
+        // Status code, word count and page title stay; length, body content and Last-Modified vary.
+        assertEquals(3, comparator.stableAttributeCount());
+        assertTrue(comparator.isEquivalent(FakeHttp.response(200, "<title>Account</title> Hello bob id=dddddddddddddd")));
+        assertFalse(comparator.isEquivalent(FakeHttp.response(200, "<title>Sign in</title> Hello bob id=d")));
+        assertFalse(comparator.isEquivalent(FakeHttp.response(200, "<title>Account</title> Please sign in id=d")));
+        assertFalse(comparator.isEquivalent(FakeHttp.response(302, "<title>Account</title> Hello bob id=d")));
+        assertFalse(comparator.isEquivalent(null));
+    }
+
+    @Test
+    void analysisIgnoresLengthAndJsonRulesButKeepsStatusAndSubstringRules() {
+        MinimizationConfig config = analysis();
+        config.setBodyLengthTolerancePercent(0);
+        config.setForbiddenSubstring("denied");
+        ResponseComparator comparator = new ResponseComparator(List.of(
+                FakeHttp.response(200, "one two x"), FakeHttp.response(200, "one two yyyy")), config);
+
+        assertTrue(comparator.isEquivalent(FakeHttp.response(200, "one two zzzzzzzzzzzzzzzzzzzzz")));
+        assertFalse(comparator.isEquivalent(FakeHttp.response(200, "one two denied")));
+
+        // A sample only has to agree on status code and the substring rules.
+        assertTrue(comparator.acceptsSample(FakeHttp.response(200, "completely different now")));
+        assertFalse(comparator.acceptsSample(FakeHttp.response(500, "one two x")));
+
+        config.setMatchStatusCode(false);
+        ResponseComparator anyStatus = new ResponseComparator(List.of(
+                FakeHttp.response(200, "one two x"), FakeHttp.response(200, "one two yyyy")), config);
+        assertTrue(anyStatus.isEquivalent(FakeHttp.response(201, "one two z")));
+    }
+
+    @Test
+    void analysisFailureIsReportedNotHidden() {
+        assertThrows(RuntimeException.class, () -> new ResponseComparator(List.of(
+                FakeHttp.responseWithoutAnalysis(200, "a"), FakeHttp.responseWithoutAnalysis(200, "a")), analysis()));
+        // Rules mode never asks Burp for attributes.
+        assertTrue(new ResponseComparator(FakeHttp.responseWithoutAnalysis(200, "a"), new MinimizationConfig())
+                .isEquivalent(FakeHttp.responseWithoutAnalysis(200, "a")));
     }
 
     @Test

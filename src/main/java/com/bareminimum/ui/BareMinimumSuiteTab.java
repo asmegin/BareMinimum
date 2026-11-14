@@ -5,6 +5,7 @@ import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.ui.editor.EditorOptions;
 import burp.api.montoya.ui.editor.RawEditor;
+import com.bareminimum.core.DeltaDebugMinimizer;
 import com.bareminimum.core.DeltaDebugMinimizer.MinimizationResult;
 import com.bareminimum.core.DeltaDebugMinimizer.ProgressListener;
 import com.bareminimum.core.DeltaDebugMinimizer.StepLog;
@@ -18,6 +19,7 @@ import com.bareminimum.model.RemovableItem;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
+import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JProgressBar;
@@ -222,7 +224,29 @@ public final class BareMinimumSuiteTab extends JPanel implements ProgressListene
 
         int row = 0;
 
+        // 0. How responses are compared
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.gridwidth = 1;
+        form.add(new JLabel("Response matching:"), gbc);
+
+        gbc.gridx = 1;
+        JComboBox<MinimizationConfig.ResponseMatching> matchingCombo =
+                new JComboBox<>(MinimizationConfig.ResponseMatching.values());
+        SafeRendering.harden(matchingCombo);
+        matchingCombo.setSelectedItem(config.getResponseMatching());
+        form.add(matchingCombo, gbc);
+
+        row++;
+        gbc.gridx = 0;
+        gbc.gridy = row;
+        gbc.gridwidth = 2;
+        form.add(new JLabel("Burp's response analysis sends the original request " + DeltaDebugMinimizer.ANALYSIS_SAMPLES
+                + " times and then requires every response attribute that stayed the same (status, content type,"
+                + " title, word count, visible text ...) to stay the same."), gbc);
+
         // 1. Match Status Code
+        row++;
         gbc.gridx = 0;
         gbc.gridy = row;
         gbc.gridwidth = 2;
@@ -267,6 +291,23 @@ public final class BareMinimumSuiteTab extends JPanel implements ProgressListene
                 config.isVerifyBaselineStability());
         stabilityCheck.addActionListener(e -> config.setVerifyBaselineStability(stabilityCheck.isSelected()));
         form.add(stabilityCheck, gbc);
+
+        // The length, JSON-key and stability settings only apply to the rules.
+        Runnable updateRuleControls = () -> {
+            boolean rules = config.getResponseMatching() == MinimizationConfig.ResponseMatching.RULES;
+            bodyLenCheck.setEnabled(rules);
+            toleranceSpinner.setEnabled(rules);
+            jsonCheck.setEnabled(rules);
+            stabilityCheck.setEnabled(rules);
+        };
+        matchingCombo.addActionListener(e -> {
+            Object selected = matchingCombo.getSelectedItem();
+            if (selected instanceof MinimizationConfig.ResponseMatching matching) {
+                config.setResponseMatching(matching);
+                updateRuleControls.run();
+            }
+        });
+        updateRuleControls.run();
 
         // 5. Required Substring
         row++;

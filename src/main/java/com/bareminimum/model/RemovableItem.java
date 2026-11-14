@@ -16,7 +16,8 @@ public record RemovableItem(
         HEADER("Header"),
         URL_PARAM("URL Param"),
         BODY_PARAM("Body Param"),
-        JSON_PARAM("JSON Body Field");
+        JSON_PARAM("JSON Body Field"),
+        XML_PARAM("XML Body Item");
 
         private final String displayName;
 
@@ -29,7 +30,7 @@ public record RemovableItem(
         }
 
         public boolean isParameter() {
-            return this == URL_PARAM || this == BODY_PARAM || this == JSON_PARAM;
+            return this != COOKIE && this != HEADER;
         }
     }
 
