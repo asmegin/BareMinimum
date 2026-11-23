@@ -192,7 +192,23 @@ public final class MinimizationConfig {
         if (headerName == null) {
             return false;
         }
-        return pinnedHeaders.contains(headerName.trim().toLowerCase(Locale.ROOT));
+        String normalized = headerName.trim().toLowerCase(Locale.ROOT);
+        return isAlwaysPinned(normalized) || pinnedHeaders.contains(normalized);
+    }
+
+    /**
+     * Headers that carry HTTP framing or HTTP/2 request-line metadata ({@code Host},
+     * {@code Content-Length}, and HTTP/2 pseudo-headers such as {@code :method}, {@code :scheme},
+     * {@code :authority}, and {@code :path}) and must never be removed.
+     */
+    public static boolean isAlwaysPinned(String headerName) {
+        if (headerName == null) {
+            return false;
+        }
+        String normalized = headerName.trim().toLowerCase(Locale.ROOT);
+        return normalized.startsWith(":")
+                || "host".equals(normalized)
+                || "content-length".equals(normalized);
     }
 
     public int getRequestDelayMs() {

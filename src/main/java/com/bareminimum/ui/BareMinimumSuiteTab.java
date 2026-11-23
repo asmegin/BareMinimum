@@ -374,7 +374,7 @@ public final class BareMinimumSuiteTab extends JPanel implements ProgressListene
         gbc.gridy = row;
         gbc.gridwidth = 2;
         form.add(new JLabel("Settings apply to the next run and are remembered between Burp sessions."
-                + " Host and Content-Length are always pinned."), gbc);
+                + " Host, Content-Length, and HTTP/2 pseudo-headers are always pinned."), gbc);
 
         outer.add(form, BorderLayout.NORTH);
         return outer;

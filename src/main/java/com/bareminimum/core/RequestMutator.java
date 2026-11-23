@@ -171,12 +171,12 @@ public final class RequestMutator {
             List<HttpHeader> cookieList = new ArrayList<>();
             for (HttpHeader header : headers) {
                 String name = header.name();
-                if (name == null) {
+                if (name == null || name.isBlank()) {
                     continue;
                 }
                 if (COOKIE.equalsIgnoreCase(name)) {
                     cookieList.add(header);
-                } else if (!config.isHeaderPinned(name)) {
+                } else if (!MinimizationConfig.isAlwaysPinned(name) && !config.isHeaderPinned(name)) {
                     candidateList.add(header);
                 }
             }

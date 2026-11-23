@@ -56,33 +56,107 @@ public final class FakeHttp {
     public static HttpRequest request(RemoveMode mode, String method, String path, String body, String... headerLines) {
         List<HttpHeader> headers = new ArrayList<>();
         for (String line : headerLines) {
-            int colon = line.indexOf(':');
+            int colon = line.startsWith(":") ? line.indexOf(':', 1) : line.indexOf(':');
             headers.add(header(line.substring(0, colon), line.substring(colon + 1).trim()));
         }
-        return build(mode, method, path, headers, body == null ? "" : body);
+        return build(mode, method, path, headers, body == null ? "" : body, false);
     }
 
-    private static HttpRequest build(RemoveMode mode, String method, String path, List<HttpHeader> headers, String body) {
+    /**
+     * Builds an HTTP/2 request whose {@code headers()} includes the {@code :method},
+     * {@code :scheme}, {@code :path}, and {@code :authority} pseudo-headers, matching Montoya's
+     * HTTP/2 representation (where removing {@code :path} resets {@code path()} to {@code "/"}).
+     */
+    public static HttpRequest http2Request(
+            RemoveMode mode,
+            String method,
+            String path,
+            String authority,
+            String body,
+            String... headerLines) {
+        List<HttpHeader> headers = new ArrayList<>();
+        headers.add(header(":method", method));
+        headers.add(header(":scheme", "https"));
+        headers.add(header(":path", path));
+        headers.add(header(":authority", authority));
+        for (String line : headerLines) {
+            int colon = line.startsWith(":") ? line.indexOf(':', 1) : line.indexOf(':');
+            headers.add(header(line.substring(0, colon), line.substring(colon + 1).trim()));
+        }
+        return build(mode, method, path, headers, body == null ? "" : body, true);
+    }
+
+    public static HttpRequest http2Request(
+            String method,
+            String path,
+            String authority,
+            String body,
+            String... headerLines) {
+        return http2Request(RemoveMode.FIRST_MATCH, method, path, authority, body, headerLines);
+    }
+
+    private static String effectivePath(String path, List<HttpHeader> headers, boolean http2) {
+        if (!http2) {
+            return path;
+        }
+        for (HttpHeader h : headers) {
+            if (":path".equalsIgnoreCase(h.name())) {
+                return h.value();
+            }
+        }
+        return "/";
+    }
+
+    private static HttpRequest build(
+            RemoveMode mode,
+            String method,
+            String path,
+            List<HttpHeader> headers,
+            String body,
+            boolean http2) {
+        String currentPath = effectivePath(path, headers, http2);
         return (HttpRequest) Proxy.newProxyInstance(
                 HttpRequest.class.getClassLoader(),
                 new Class<?>[]{HttpRequest.class},
                 (proxy, m, args) -> switch (m.getName()) {
                     case "method" -> method;
-                    case "path" -> path;
-                    case "pathWithoutQuery" -> path.contains("?") ? path.substring(0, path.indexOf('?')) : path;
-                    case "query" -> path.contains("?") ? path.substring(path.indexOf('?') + 1) : "";
+                    case "path" -> currentPath;
+                    case "pathWithoutQuery" -> currentPath.contains("?")
+                            ? currentPath.substring(0, currentPath.indexOf('?'))
+                            : currentPath;
+                    case "query" -> currentPath.contains("?")
+                            ? currentPath.substring(currentPath.indexOf('?') + 1)
+                            : "";
                     case "headers" -> List.copyOf(headers);
                     case "bodyToString" -> body;
                     case "body" -> bytes(body);
-                    case "toByteArray" -> bytes(render(method, path, headers, body));
+                    case "toByteArray" -> bytes(render(method, currentPath, headers, body));
                     case "httpService" -> null;
                     case "copyToTempFile" -> proxy;
-                    case "withPath" -> build(mode, method, (String) args[0], headers, body);
-                    case "withBody" -> build(mode, method, path, withContentLength(headers, (String) args[0]), (String) args[0]);
+                    case "withPath" -> {
+                        String newPath = (String) args[0];
+                        List<HttpHeader> next = new ArrayList<>(headers);
+                        if (http2) {
+                            boolean updated = false;
+                            for (int i = 0; i < next.size(); i++) {
+                                if (":path".equalsIgnoreCase(next.get(i).name())) {
+                                    next.set(i, header(next.get(i).name(), newPath));
+                                    updated = true;
+                                    break;
+                                }
+                            }
+                            if (!updated) {
+                                next.add(0, header(":path", newPath));
+                            }
+                        }
+                        yield build(mode, method, newPath, next, body, http2);
+                    }
+                    case "withBody" -> build(mode, method, currentPath,
+                            withContentLength(headers, (String) args[0]), (String) args[0], http2);
                     case "withAddedHeader" -> {
                         List<HttpHeader> next = new ArrayList<>(headers);
                         next.add(header((String) args[0], (String) args[1]));
-                        yield build(mode, method, path, next, body);
+                        yield build(mode, method, currentPath, next, body, http2);
                     }
                     case "withUpdatedHeader" -> {
                         List<HttpHeader> next = new ArrayList<>(headers);
@@ -92,7 +166,7 @@ public final class FakeHttp {
                                 break;
                             }
                         }
-                        yield build(mode, method, path, next, body);
+                        yield build(mode, method, currentPath, next, body, http2);
                     }
                     case "withRemovedHeader" -> {
                         String name = (String) args[0];
@@ -107,9 +181,9 @@ public final class FakeHttp {
                                 }
                             }
                         }
-                        yield build(mode, method, path, next, body);
+                        yield build(mode, method, currentPath, next, body, http2);
                     }
-                    case "toString" -> render(method, path, headers, body);
+                    case "toString" -> render(method, currentPath, headers, body);
                     case "equals" -> proxy == args[0];
                     case "hashCode" -> System.identityHashCode(proxy);
                     default -> throw new UnsupportedOperationException("FakeHttp request: " + m.getName());

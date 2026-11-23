@@ -398,4 +398,69 @@ class RequestMutatorTest {
         HttpRequest mutated = subset(request, MinimizationTarget.COOKIES, item -> item.name().equals("big"));
         assertEquals(List.of("Host: h", "Cookie: big=" + huge), FakeHttp.headerLines(mutated));
     }
+
+    @ParameterizedTest
+    @EnumSource(RemoveMode.class)
+    void http2PseudoHeadersAndHostAreNeverRemovedWhenApplyingProfileOrMinimizing(RemoveMode mode) {
+        String apiPath = "/banking/customer-files/v1/profiles";
+        HttpRequest request = FakeHttp.http2Request(mode, "GET", apiPath, "api.bank.example", "",
+                "Host: api.bank.example",
+                "Cookie: session=ok; tracking=drop",
+                "User-Agent: Mozilla/5.0",
+                "Accept: application/json");
+
+        // Pseudo-headers and Host must not be offered as removable candidates.
+        List<RemovableItem> candidates = RequestMutator.extractCandidates(request, MinimizationTarget.ALL, config);
+        assertEquals(List.of(
+                new RemovableItem(Category.COOKIE, "session", "ok", 0),
+                new RemovableItem(Category.COOKIE, "tracking", "drop", 1),
+                new RemovableItem(Category.HEADER, "User-Agent", "Mozilla/5.0", 0),
+                new RemovableItem(Category.HEADER, "Accept", "application/json", 1)
+        ), candidates);
+
+        // Applying a GET - ALL profile that has no required headers must preserve :authority, :path,
+        // :method, :scheme, and Host, and must not reset the path to "/".
+        MinimizationProfile profile = new MinimizationProfile(
+                "GET - ALL 1", "GET", "/other/endpoint", MinimizationTarget.ALL,
+                Set.of("session"), Set.of(), Set.of(), Set.of(), 4, 1, 5, null, null);
+        HttpRequest minimized = RequestMutator.applyProfile(request, profile, config);
+
+        assertEquals(apiPath, minimized.path());
+        assertEquals(List.of(
+                ":method: GET",
+                ":scheme: https",
+                ":path: " + apiPath,
+                ":authority: api.bank.example",
+                "Host: api.bank.example",
+                "Cookie: session=ok"
+        ), FakeHttp.headerLines(minimized));
+
+        // Dropping every candidate item must still preserve all pseudo-headers and Host.
+        HttpRequest bare = RequestMutator.buildRequestWithSubset(request, MinimizationTarget.ALL, Set.of(), config);
+        assertEquals(apiPath, bare.path());
+        assertEquals(List.of(
+                ":method: GET",
+                ":scheme: https",
+                ":path: " + apiPath,
+                ":authority: api.bank.example",
+                "Host: api.bank.example"
+        ), FakeHttp.headerLines(bare));
+    }
+
+    @Test
+    void http2QueryParametersCanBeMinimizedWhileKeepingPathAndAuthority() {
+        HttpRequest request = FakeHttp.http2Request(
+                "GET", "/banking/customer-files/v1/profiles?account=42&utm=drop", "api.bank.example", "",
+                "Accept: application/json");
+
+        HttpRequest minimized = subset(request, MinimizationTarget.ALL, item -> item.name().equals("account"));
+
+        assertEquals("/banking/customer-files/v1/profiles?account=42", minimized.path());
+        assertEquals(List.of(
+                ":method: GET",
+                ":scheme: https",
+                ":path: /banking/customer-files/v1/profiles?account=42",
+                ":authority: api.bank.example"
+        ), FakeHttp.headerLines(minimized));
+    }
 }

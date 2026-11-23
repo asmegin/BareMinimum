@@ -92,7 +92,7 @@ Every request editor has a **BareMinimum** tab next to Pretty / Raw / Hex.
 Other settings:
 
 - **Stability check** (rules mode, on by default) — sends the original request a second time before searching. If the two responses do not match each other under your rules, the run stops and tells you, because no comparison would be reliable. Loosen the rules, add a required string, or switch to Burp's response analysis, and try again.
-- **Pinned headers** — headers that are never removed. `Host` and `Content-Length` are always pinned.
+- **Pinned headers** — headers that are never removed. `Host`, `Content-Length`, and HTTP/2 pseudo-headers (`:authority`, `:path`, `:method`, `:scheme`) are always pinned.
 - **Delay between requests** — for rate-limited targets. Any delay means requests go one at a time.
 - **Parallel requests** (default 4, up to 16) — how many test requests may be in flight at once. 1 sends them one after another.
 
@@ -141,12 +141,12 @@ Requires JDK 17 or newer. The Gradle wrapper is included.
 ./gradlew clean test jar
 ```
 
-On Windows use `gradlew.bat`. The extension is written to `build/libs/BareMinimum-1.0.0.jar`. It has no dependencies beyond the Montoya API, which Burp provides.
+On Windows use `gradlew.bat`. The extension is written to `build/libs/BareMinimum-1.0.1.jar`. It has no dependencies beyond the Montoya API, which Burp provides.
 
 ## Installing
 
 1. In Burp, open **Extensions > Installed** and click **Add**.
-2. Leave **Extension type** as **Java** and select `build/libs/BareMinimum-1.0.0.jar`.
+2. Leave **Extension type** as **Java** and select `build/libs/BareMinimum-1.0.1.jar`.
 
 Requires Burp Suite 2023.12 or later.
 

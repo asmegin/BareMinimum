@@ -78,6 +78,16 @@ class ModelTest {
         assertEquals("host, content-length", config.getPinnedHeadersCsv());
         config.setPinnedHeadersFromCsv(null);
         assertEquals("host, content-length", config.getPinnedHeadersCsv());
+
+        // HTTP/2 pseudo-headers are always pinned without cluttering the user's CSV list.
+        assertTrue(config.isHeaderPinned(":authority"));
+        assertTrue(config.isHeaderPinned(":path"));
+        assertTrue(config.isHeaderPinned(":method"));
+        assertTrue(config.isHeaderPinned(":scheme"));
+        assertTrue(config.isHeaderPinned(" :PATH "));
+        assertTrue(MinimizationConfig.isAlwaysPinned("HOST"));
+        assertTrue(MinimizationConfig.isAlwaysPinned(":authority"));
+        assertFalse(MinimizationConfig.isAlwaysPinned("User-Agent"));
     }
 
     @Test
